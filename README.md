@@ -1,0 +1,114 @@
+# 多Agent运营协同平台
+
+## 项目简介
+
+面向电商运营，把客服咨询、证据约束的图文创作、人工审核和知识复用接到同一工作台。遇到知识缺口时，运营可以把一轮文字或语音咨询转为内容任务，补齐依据、审核草稿并按版本发布。下次遇到明确命中的售后问题，客服直接发送审核过的标准回复，跳过本轮向量检索和回答模型。
+
+**技术栈** · FastAPI · LangGraph · PostgreSQL · Milvus · Vue 3 · React · 火山引擎 Ark / RTC
+
+![客服试聊引用商品规格原文并展示对应资料](docs/images/01-catalog-rag.png)
+
+## 四个模块
+
+- **客服试聊**提供文字与实时语音咨询。重量、尺寸、容量等可核对的售前规格直接摘取商品资料原文。售后优先匹配已发布的 Wiki，其他问题使用原始资料检索与模型回答，回答可追溯到资料或资产。
+- **内容任务**从单轮咨询提取运营线索。支持证据约束的图文和 FAQ 创作，也支持生成售后 Wiki 草稿，预填标准问题、同义问法、适用范围、标准回复及处理步骤。运营可修改草稿，一键批准审定版本。
+- **内容资产**保留审核正文、出处与版本。运营可发布、修订或撤回 FAQ 和 Wiki，也可从资产页发起一次客服验证。
+- **自由创作**提供独立的选题、撰写、修订和配图流程。文本创作可在人工选题及审稿处暂停，配图使用可配置的火山方舟图像生成服务。
+
+## 演示
+
+### 1. 从咨询到审核
+
+在客服回答下点击「转为内容任务」，选择「售后 Wiki」。系统用选定资料预填待审草稿，运营核对并修改后点击「批准 Wiki 草稿」。
+
+![运营核对售后 Wiki 的预填字段并批准草稿](docs/images/02-wiki-review.png)
+
+### 2. 发布审核版本
+
+批准后在「内容资产」查看标准回复和来源，点击发布。后续复用的是发布版本中人工审定的标准回复。
+
+![内容资产显示已发布的售后 Wiki、标准回复和引用资料](docs/images/03-wiki-published.png)
+
+### 3. 客服复问命中 Wiki
+
+点击资产里的「去客服验证」，发送预填的问题。标准问题或已审核别名明确命中时，客服提示「直接复用售后 Wiki · 跳过回答模型」。点击「查看本轮 Wiki 条目」可回到上一步的已发布资产。
+
+![客服复问命中售后 Wiki 并提供查看本轮条目的入口](docs/images/04-wiki-reuse.png)
+
+<details>
+<summary>自由创作与图文成果</summary>
+
+![自由创作生成的文章和配图](docs/images/05-creative-studio.png)
+
+</details>
+
+<details>
+<summary>实时语音与通话字幕</summary>
+
+文字和实时语音共用客服知识与回答规则。通话完成的咨询可在同一账号下查看，并进入内容任务流程。
+
+![实时语音客服通话中的用户和助手字幕](docs/images/06-rtc-subtitles.png)
+
+</details>
+
+## 处理与存储
+
+```mermaid
+flowchart LR
+    A["文字 / RTC 咨询"] --> B["客服回答"]
+    B --> C["商品原文摘引 / Milvus 检索"]
+    C --> B
+    B --> D["选取一轮咨询"]
+    D --> E["内容任务：生成草稿和引用"]
+    E --> F["人工修订与批准"]
+    F --> G["内容资产：版本化发布"]
+    G --> H["售后 Wiki：精确匹配已审问法"]
+    H --> B
+    G --> I["普通 FAQ：补充回答上下文"]
+    I --> B
+```
+
+- **客服 Agent**按问题走原文摘引、已审 Wiki 直接答复、检索与生成等路径。直接复用要求当前账号、当前知识快照下唯一命中已发布条目。找不到可靠依据时，回复待核实并保留可用的原始出处。
+- **内容 Agent**用 LangGraph 串联创作、事实检查与人工审核。检查覆盖 SKU、数值和单位、明确的政策条件及引用。PostgreSQL 持久化审批状态、创作检查点和幂等操作，支持刷新后继续审稿。
+- **知识资产**由 PostgreSQL 保存结构化 Wiki、来源、审核版本和发布状态。Milvus 索引原始资料，用于召回与溯源。撤回条目或切换知识快照后，回答链路会排除失效版本。 [售后 Wiki 的回答顺序与发布规则](docs/SUPPORT_WIKI.md)
+
+## 本地运行
+
+以下命令从仓库根目录执行，依赖 Python 3.13、uv、Node.js 24 和运行 Linux 容器的 Docker Desktop。
+
+```powershell
+cd backend
+uv sync --frozen
+cd ..\frontend-ops
+npm ci
+cd ..
+.\start.cmd -SkipVoice
+```
+
+打开 [工作台](http://127.0.0.1:5178) 并自行注册。启动脚本生成本地数据库密码和应用密钥，使用 PostgreSQL、演示资料字面检索和模拟模型，可以体验文字与内容审核主流程。[本地 API 文档](http://127.0.0.1:8010/docs)
+
+使用自己的云账号接入真实文本、Embedding、配图和语音。以 [环境变量示例](backend/.env.example) 为参照补充私有配置，保留首次启动生成的数据库和应用密钥。
+
+- **Milvus**　初始化本地配置后运行 `docker compose --profile vector up -d --wait`，再从 `backend` 执行 `.\.venv\Scripts\python.exe -m app.fusion.knowledge --sync-milvus`。首次建索引调用真实 Embedding。单独同步索引后，可在启动真实文字服务前设置 `$env:FUSION_ACTIVATE_RETRIEVAL = 'milvus'`，再运行 `.\start.cmd -Live -WithVector -SkipVoice` 激活使用。 [知识快照说明](knowledge/snapshots/README.md)
+- **实时语音**　配置自己的 RTC、语音助手和 ngrok 回调，在 `frontend-voice` 运行 `npm ci` 和 `npm run build`。停掉普通模式后从根目录运行 `.\start-voice.cmd -NgrokExe (Get-Command ngrok).Source -CheckOnly`，预检通过后去掉 `-CheckOnly` 启动。[配置与验收指南](docs/MANUAL_ACCEPTANCE.md)
+
+关闭普通模式用 `.\stop.cmd`，关闭语音模式用 `.\stop-voice.cmd`。追加 `-StopInfrastructure` 可同时停止本工程容器并保留数据库卷。
+
+## 测试与实现范围
+
+```powershell
+.\backend\.venv\Scripts\python.exe scripts\run_tests.py
+node --test --test-isolation=none frontend-ops/src/*.test.js frontend-voice/src/fusion-voice.test.cjs scripts/callback-gateway.test.cjs
+```
+
+已在真实 Milvus 与模型环境验证原文引用、Wiki 草稿审核、发布、复用与撤回；RTC 使用合成音频作为浏览器输入，验证 ASR、下行语音、挂断重连及语音咨询转任务。仓库示例使用虚构商品和政策，演示范围为咨询、创作与内部发布。[验收记录](docs/MANUAL_RESULTS.md)
+
+## 仓库结构
+
+- [`backend/app/fusion/`](backend/app/fusion/)　咨询、知识快照、事实校验、内容资产及语音适配
+- [`frontend-ops/`](frontend-ops/)　运营工作台与自由创作
+- [`frontend-voice/`](frontend-voice/)　独立构建的 RTC 通话页面
+- [`knowledge/snapshots/`](knowledge/snapshots/)　演示资料及快照说明
+- [`scripts/`](scripts/)　本地配置、服务启停与验收脚本
+
+[产品需求](docs/01_PRD_电商运营Agent融合方案.md) · [技术与架构](docs/02_技术与架构_电商运营Agent融合方案.md) · [第三方代码及来源](THIRD_PARTY_NOTICES.md)
