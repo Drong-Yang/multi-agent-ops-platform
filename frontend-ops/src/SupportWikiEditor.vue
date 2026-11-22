@@ -11,7 +11,9 @@ const props = defineProps({
 const emit = defineEmits(['approve'])
 const pending = props.task.wiki_draft?.fields
 const version = pending || props.task.wiki || {}
-const availableEvidence = computed(() => props.task.knowledge_snapshot_id === props.activeSnapshot ? (props.task.evidence_refs || []) : [])
+const fromModelAssist = computed(() => props.task.source_answer_route === 'model_assist')
+const availableEvidence = computed(() => !fromModelAssist.value && props.task.knowledge_snapshot_id === props.activeSnapshot
+  ? (props.task.evidence_refs || []) : [])
 const generating = ref(false)
 const draft = reactive({
   title: version.title ?? props.task.topic_direction.slice(0, 120),
@@ -30,7 +32,8 @@ const draft = reactive({
 const lines = value => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
 const canUseOriginal = computed(() => ['rag', undefined, null].includes(props.task.source_answer_route) && !!props.task.source_answer)
 const hasSupplement = computed(() => Boolean(draft.titleSource.trim() || draft.urlSource.trim() || draft.excerpt.trim()))
-const canDraft = computed(() => hasSupplement.value
+const needsSupplement = computed(() => fromModelAssist.value || hasSupplement.value)
+const canDraft = computed(() => needsSupplement.value
   ? Boolean(draft.titleSource.trim() && draft.urlSource.trim() && draft.excerpt.trim())
   : availableEvidence.value.some(e => draft.evidence.includes(e.chunk_id)))
 const canApprove = computed(() => canDraft.value && [draft.title, draft.question, draft.scope, draft.steps,
@@ -60,6 +63,7 @@ onMounted(() => {
   if (!pending && !props.task.wiki && canDraft.value) void suggest()
 })
 function approve() {
+  if (!canApprove.value || props.busy || generating.value) return
   emit('approve', {
     expected_state_version: props.task.state_version,
     title: draft.title, question: draft.question, aliases: lines(draft.aliases), scope: draft.scope,
@@ -75,6 +79,10 @@ function approve() {
     <p v-if="generating" class="support" role="status">正在根据已选资料填写 Wiki 草稿…</p>
     <p v-else-if="pending" class="support" role="status">Wiki 草稿已预填，可核对或修改后批准。</p>
     <p v-else class="support">选取原始资料或补充证据即可预填草稿。审核后到内容资产发布。</p>
+    <details v-if="fromModelAssist && task.source_answer">
+      <summary>DeepSeek 原回答 · 待核验线索</summary>
+      <p class="support">{{ task.source_answer }}</p>
+    </details>
     <fieldset :disabled="busy || generating">
       <label>条目标题<input v-model="draft.title" required minlength="2" maxlength="120"></label>
       <label>标准问题<input v-model="draft.question" required minlength="4" maxlength="200"></label>
@@ -95,10 +103,11 @@ function approve() {
       </details>
       <details :open="!availableEvidence.length || hasSupplement">
         <summary>补充可核验资料</summary>
-        <p class="support">可填写官方手册、公告或经核实的内部文档出处。请核对摘录支持上面的答复及步骤。</p>
-        <label>资料名称<input v-model="draft.titleSource" :required="hasSupplement" minlength="2" maxlength="150"></label>
-        <label>HTTPS 来源地址<input v-model="draft.urlSource" :required="hasSupplement" type="url"></label>
-        <label>原始资料摘录<textarea v-model="draft.excerpt" :required="hasSupplement" minlength="10" maxlength="3000" rows="3"></textarea></label>
+        <p v-if="fromModelAssist" class="support">请补充独立的官方手册、公告或经核实的文档，核对原文能支持答复后再审核。</p>
+        <p v-else class="support">可填写官方手册、公告或经核实的内部文档出处。请核对摘录支持上面的答复及步骤。</p>
+        <label>资料名称<input v-model="draft.titleSource" :required="needsSupplement" minlength="2" maxlength="150"></label>
+        <label>HTTPS 来源地址<input v-model="draft.urlSource" :required="needsSupplement" type="url"></label>
+        <label>原始资料摘录<textarea v-model="draft.excerpt" :required="needsSupplement" minlength="10" maxlength="3000" rows="3"></textarea></label>
       </details>
       <button type="button" class="secondary" :disabled="!canDraft" @click="suggest">用所选资料生成 Wiki 草稿</button>
       <details v-if="pages.length">

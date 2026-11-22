@@ -40,6 +40,13 @@ export function draftInsightFromTurn(turn) {
   const question = turn.question || turn.content || ''
   return { turn_id: turn.turn_id, summary: question.replace(/1[3-9]\d{9}/g, '[手机号已移除]').replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[邮箱已移除]'), confirmed: false }
 }
+
+export function turnContentAction(turn) {
+  if (turn.answer_route === 'assistant_intro') return null
+  if (turn.answer_route === 'model_assist') return turn.wiki_candidate === true ? 'model_wiki' : null
+  return 'content'
+}
+
 export const canCreateInsight = draft => !!(draft?.confirmed && draft.turn_id && draft.summary?.trim())
 export const canPublishAsset = (asset, active) => !!(asset.text_review_status === 'approved' && asset.publication_status === 'draft' &&
   asset.knowledge_snapshot_id === active && asset.fact_check_report?.passed !== false && ['pass', 'passed'].includes(asset.fact_check_report?.status))

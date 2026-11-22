@@ -4,7 +4,8 @@ import * as auth from './api.js'
 import LegacyCreator from './LegacyCreator.vue'
 import SupportWikiEditor from './SupportWikiEditor.vue'
 import { createFusionClient } from './fusion-api.js'
-import { normalizeTask, mergeTaskSnapshot, approvedAssetForTask, applyTaskEvent, draftInsightFromTurn, canCreateInsight, canPublishAsset } from './fusion-state.js'
+import { isVoiceChannelReady, openVoiceChannel, voiceChannelNotice } from './voice-channel.js'
+import { normalizeTask, mergeTaskSnapshot, approvedAssetForTask, applyTaskEvent, draftInsightFromTurn, turnContentAction, canCreateInsight, canPublishAsset } from './fusion-state.js'
 import { lineDiff, versionView } from './version-diff.js'
 import { assetReuseView, faqReuseView, createFaqVerification } from './faq-reuse-view.js'
 
@@ -15,18 +16,26 @@ const knowledge = ref(null), session = ref(null), question = ref(''), sending = 
 const tasks = ref([]), assets = ref([]), current = ref(null), feedback = ref(''), selectedVersion = ref('')
 const insightDraft = ref(null), format = ref('faq'), productScope = ref(''), audience = ref('准备选购商品的用户')
 const sessions = ref([]), wikiOption = ref(false)
+const voiceAvailability = ref(null), checkingVoice = ref(false), openingVoice = ref(false), voiceError = ref('')
+const voiceReady = computed(() => isVoiceChannelReady(voiceAvailability.value))
 const verificationTarget = ref(null), highlightedAsset = ref(''), highlightedTurn = ref('')
 const transcript = ref(null), composer = ref(null), insightSummary = ref(null), pendingQuestion = ref('')
 const examples = ['SC-PB27 多重？', '耳机拆封后能退吗？', 'SC-PB20 和 SC-PB27 有什么区别？']
-const consultationTurns = computed(() => (session.value?.turns || []).map(turn => ({ ...turn, reuseView: faqReuseView(turn) })))
+const consultationTurns = computed(() => (session.value?.turns || []).map(turn => ({
+  ...turn, reuseView: faqReuseView(turn), contentAction: turnContentAction(turn)
+})))
+const modelWikiInsight = computed(() => consultationTurns.value.some(turn =>
+  turn.turn_id === insightDraft.value?.turn_id && turn.contentAction === 'model_wiki'))
 const assetRows = computed(() => assets.value.map(asset => ({ ...asset, reuseView: assetReuseView(asset, knowledge.value?.knowledge_snapshot_id) })))
 let eventsAbort = null, refreshTimer = null
 const titles = { consultation: '客服试聊', tasks: '内容任务', assets: '内容资产', free: '自由创作' }
 const phaseNames = { queued: '等待执行', running: '正在生成', waiting_human: '等待人工决策', text_approved: '文本已批准', failed: '执行失败', interrupted: '已中断', completed: '已完成' }
 const assetNames = { draft: '待发布', published: '已发布', stale: '知识已更新', revoked: '已撤回', superseded: '已有更新版本' }
 const typeNames = { faq: 'FAQ', article: '图文', wiki: '售后 Wiki' }
-const answerRoutes = { support_wiki: '直接复用售后 Wiki', catalog_quote: '引用商品原文', rag: '原始资料检索',
-  business_boundary: '固定业务答复', no_evidence: '待核实 · 资料不足' }
+const answerRoutes = { support_wiki: '直接复用售后 Wiki', catalog_quote: '引用商品原文', policy_quote: '引用售后规则', rag: '原始资料检索',
+  business_boundary: '固定业务答复', no_evidence: '待核实 · 资料不足', safety_incident: '安全事件优先处理',
+  recommendation: '商品推荐', assistant_intro: '客服能力说明', model_assist: 'DeepSeek 辅助 · 未经资料核验',
+  context_followup: '结合会话回答', clarification: '确认咨询对象' }
 const relatedWikiPages = computed(() => assets.value.filter(asset => asset.wiki_eligible && asset.task_id !== current.value?.task_id))
 const nodeNames = { plan_topics: '准备选题', write_draft: '撰写正文', quality_check: '检查内容要求', fact_check: '核对商品事实', human_review: '等待审稿' }
 const article = computed(() => versionView(current.value, selectedVersion.value))
@@ -65,22 +74,52 @@ async function lists() {
 }
 async function initialize() {
   user.value = await auth.getCurrentUser()
+  void refreshVoiceAvailability()
   await lists()
   const remembered = sessionStorage.getItem('fusion_consultation')
   if (remembered) { try { session.value = await client.getSession(remembered) } catch { session.value = null } }
   if (!session.value) await newSession()
   else await scrollToLatest(true)
 }
+function authErrorMessage(e, registering) {
+  const status = e.response?.status
+  if (status === 401) return '用户名或密码错误。'
+  if (registering && status === 400 && e.response?.data?.detail === '用户名已存在') {
+    return '用户名已存在。请返回登录，或换一个用户名注册。'
+  }
+  if (status === 422) {
+    return registering ? '用户名需为 3 到 50 个字符，密码需为 6 到 100 个字符。' : '请检查用户名和密码后重试。'
+  }
+  if (!status) return '无法连接工作台，请确认服务已启动后重试。'
+  return registering ? '注册失败，请稍后重试。' : '登录失败，请稍后重试。'
+}
 async function signIn() {
   await run(async () => {
-    if (signingUp.value) await auth.register(credentials.value.username, credentials.value.password)
-    await auth.login(credentials.value.username, credentials.value.password)
-    credentials.value.password = ''; await initialize()
+    const registering = signingUp.value
+    const { username, password } = credentials.value
+    try {
+      if (registering) await auth.register(username, password)
+      await auth.login(username, password)
+    } catch (e) {
+      error.value = authErrorMessage(e, registering)
+      return
+    }
+    credentials.value.password = ''
+    await initialize()
   })
+}
+function switchAuthMode() {
+  signingUp.value = !signingUp.value
+  credentials.value.password = ''
+  error.value = ''
 }
 function logout() {
   auth.logout()
   user.value = null
+  voiceAvailability.value = null
+  checkingVoice.value = false
+  openingVoice.value = false
+  voiceError.value = ''
   session.value = null
   current.value = null
   knowledge.value = null
@@ -164,9 +203,11 @@ async function send() {
 }
 
 async function chooseTurn(turn) {
+  if (!turn.contentAction) return
   insightDraft.value = draftInsightFromTurn(turn)
   wikiOption.value = turn.wiki_candidate !== false
-  if (!wikiOption.value && format.value === 'wiki') format.value = 'faq'
+  if (turn.contentAction === 'model_wiki') format.value = 'wiki'
+  else if (!wikiOption.value && format.value === 'wiki') format.value = 'faq'
   productScope.value = [...new Set((turn.sources || []).map(s => s.sku).filter(Boolean))].join(', ')
   await nextTick()
   insightSummary.value?.focus()
@@ -261,14 +302,49 @@ async function openApprovedAsset() {
     await focusAsset(asset.asset_id)
   })
 }
+async function refreshVoiceAvailability() {
+  const token = auth.getToken()
+  if (!token || checkingVoice.value) return
+  checkingVoice.value = true
+  voiceError.value = ''
+  try {
+    const availability = await client.voiceAvailability(AbortSignal.timeout(5000))
+    if (token === auth.getToken()) voiceAvailability.value = availability
+  } catch (error) {
+    if (token !== auth.getToken()) return
+    if (error.status === 401) { fail(error); return }
+    voiceAvailability.value = null
+    voiceError.value = '语音状态检查失败，请确认工作台后端在线后重试。'
+  } finally {
+    if (token === auth.getToken()) checkingVoice.value = false
+  }
+}
+
 async function voice() {
-  // Open the tab during the click, before awaiting exchange-code creation.
-  const tab = window.open('about:blank', '_blank')
-  if (!tab) { error.value = '浏览器阻止了新窗口，请允许本站打开语音渠道。'; return }
-  await run(async () => {
-    try { const handoff = await client.handoff(); tab.location.href = `http://127.0.0.1:5179/#handoff=${encodeURIComponent(handoff.code)}` }
-    catch (e) { tab?.close(); throw e }
-  })
+  if (!voiceReady.value) return refreshVoiceAvailability()
+  const token = auth.getToken()
+  openingVoice.value = true
+  voiceError.value = ''
+  try {
+    await openVoiceChannel(voiceAvailability.value, {
+      openWindow: (url, target) => window.open(url, target),
+      handoff: async () => {
+        const handoff = await client.handoff(AbortSignal.timeout(5000))
+        if (token !== auth.getToken()) throw new Error('工作台登录状态已变化。')
+        return handoff
+      }
+    })
+  } catch (error) {
+    if (token !== auth.getToken()) return
+    if (error.status === 401) { fail(error); return }
+    if (error.status === 503) {
+      await refreshVoiceAvailability()
+      return
+    }
+    voiceError.value = error.status ? '未能进入语音渠道，请重新检查语音状态。' : error.message
+  } finally {
+    if (token === auth.getToken()) openingVoice.value = false
+  }
 }
 function authExpired() { logout() }
 onMounted(async () => {
@@ -297,9 +373,9 @@ onBeforeUnmount(() => { eventsAbort?.abort(); clearInterval(refreshTimer); windo
     </div>
     <form class="login-panel" @submit.prevent="signIn"><h2>{{ signingUp ? '创建你的工作空间' : '登录运营工作台' }}</h2><p>咨询、任务与内容按账号隔离。</p>
       <label>用户名<input v-model="credentials.username" required minlength="3" maxlength="50" autocomplete="username" placeholder="至少 3 个字符"></label>
-      <label>密码<input v-model="credentials.password" required minlength="6" type="password" :autocomplete="signingUp ? 'new-password' : 'current-password'" placeholder="至少 6 个字符"></label>
+      <label>密码<input v-model="credentials.password" required minlength="6" :maxlength="signingUp ? 100 : undefined" type="password" :autocomplete="signingUp ? 'new-password' : 'current-password'" placeholder="至少 6 个字符"></label>
       <p v-if="error" role="alert" class="error">{{ error }}</p><button class="primary" :disabled="busy">{{ busy ? '处理中…' : signingUp ? '注册并进入' : '登录' }}</button>
-      <button type="button" class="text-button" @click="signingUp = !signingUp">{{ signingUp ? '已有账号，返回登录' : '首次使用，创建账号' }}</button>
+      <button type="button" class="text-button" :disabled="busy" @click="switchAuthMode">{{ signingUp ? '已有账号，返回登录' : '首次使用，创建账号' }}</button>
     </form>
   </main>
   <div v-else class="fusion-shell">
@@ -332,7 +408,7 @@ onBeforeUnmount(() => { eventsAbort?.abort(); clearInterval(refreshTimer); windo
             <button v-if="turn.wiki_asset_id" class="text-button" :disabled="busy" @click="showAsset(turn.wiki_asset_id)">查看本轮 Wiki 条目</button><small v-if="turn.reuseView.selected.length" class="positive">本次参考了已发布 FAQ 素材</small>
             <details v-if="!turn.answer_route || turn.answer_route === 'rag'" class="reuse-trace" :open="turn.reuseView.selected.length > 0"><summary>FAQ 选用说明 · {{ turn.reuseView.selected.length ? '已参考 ' + turn.reuseView.selected.length + ' 份素材' : turn.reuseView.status === 'unknown' ? '历史记录' : '本轮未选用素材' }}</summary><p>{{ turn.reuseView.message }}</p><div v-for="reference in turn.reuseView.selected" :key="reference.asset_id" class="reuse-reference"><strong>{{ reference.title || 'FAQ 素材' }}</strong><p v-if="reference.excerpt" class="reuse-excerpt">{{ reference.excerpt }}</p><p v-if="reference.match_reason" class="support">{{ reference.match_reason }}</p><button class="text-button" :disabled="busy" @click="showAsset(reference.asset_id)">查看这份素材</button></div><ul v-if="turn.reuseView.candidates.length" class="reuse-reasons"><li v-for="candidate in turn.reuseView.candidates" :key="candidate.asset_id"><strong>{{ candidate.title || 'FAQ 素材' }}</strong>：{{ candidate.reason }}</li></ul><p v-if="turn.reuseView.selected.length" class="support">以上是本轮回答时的参考记录，不代表逐字采用。素材撤回或失效后不会被新的咨询继续选用。</p></details>
             <details v-if="turn.sources?.length"><summary>{{ turn.sources.length }} 条资料依据</summary><div v-for="source in turn.sources" :key="source.chunk_id" class="source"><strong>{{ source.source_section || source.heading }}</strong><p>{{ source.content }}</p><a v-if="source.kind === 'wiki_evidence'" :href="source.source" target="_blank" rel="noopener noreferrer">核对资料出处 ↗</a></div></details>
-            <button class="text-button link" @click="chooseTurn(turn)">转为内容任务 →</button></div></article>
+            <button v-if="turn.contentAction" class="text-button link" @click="chooseTurn(turn)">{{ turn.contentAction === 'model_wiki' ? '转为售后 Wiki 任务 →' : '转为内容任务 →' }}</button></div></article>
           <article v-if="sending" class="turn" role="status">
             <p class="question"><span>你</span>{{ pendingQuestion }}</p>
             <div class="answer"><span>客服助手 · 正在回答</span><p>{{ liveAnswer || '正在查找资料…' }}</p></div>
@@ -340,7 +416,16 @@ onBeforeUnmount(() => { eventsAbort?.abort(); clearInterval(refreshTimer); windo
           </div>
           <form class="message-form" @submit.prevent="send"><textarea ref="composer" v-model="question" :disabled="!session" aria-label="咨询问题" placeholder="输入商品或售后问题，例如 SC-PB27 多重？" rows="2" maxlength="3000"></textarea><button class="primary" :disabled="!session || sending || !question.trim()">{{ !session ? '准备会话…' : sending ? '回答中…' : '发送问题' }}</button></form>
         </section>
-        <aside class="consult-side"><section v-if="insightDraft" class="surface"><div class="section-head"><h2>转为内容任务</h2><button class="text-button" :disabled="busy" @click="insightDraft = null">取消</button></div><p class="support">核对问题摘要与商品范围，再创建任务。</p><label>问题摘要<textarea ref="insightSummary" v-model="insightDraft.summary" rows="5" maxlength="2000"></textarea></label><label>内容类型<select v-model="format" aria-label="内容类型"><option value="faq">简短 FAQ</option><option value="article">图文介绍</option><option v-if="wikiOption" value="wiki">售后 Wiki</option></select></label><template v-if="format !== 'wiki'"><label>商品型号<input v-model="productScope" placeholder="多个型号以逗号分隔"></label><label>面向谁<input v-model="audience"></label></template><p v-else class="support">资料不足也可建任务。核验手册或公告后，再审核适用范围与处理步骤。</p><label class="check"><input type="checkbox" v-model="insightDraft.confirmed">我已核对摘要并移除不必要的个人信息</label><button class="primary" :disabled="busy || !canCreateInsight(insightDraft)" @click="bridge">{{ busy ? '正在创建…' : '创建内容任务' }}</button></section>
+        <aside class="consult-side"><section v-if="insightDraft" class="surface">
+            <div class="section-head"><h2>{{ modelWikiInsight ? '转为售后 Wiki 任务' : '转为内容任务' }}</h2><button class="text-button" :disabled="busy" @click="insightDraft = null">取消</button></div>
+            <p class="support">{{ modelWikiInsight ? '核对问题摘要。创建后需补充独立资料并人工审核。' : '核对问题摘要与商品范围，再创建任务。' }}</p>
+            <label>问题摘要<textarea ref="insightSummary" v-model="insightDraft.summary" rows="5" maxlength="2000"></textarea></label>
+            <label v-if="!modelWikiInsight">内容类型<select v-model="format" aria-label="内容类型"><option value="faq">简短 FAQ</option><option value="article">图文介绍</option><option v-if="wikiOption" value="wiki">售后 Wiki</option></select></label>
+            <template v-if="format !== 'wiki'"><label>商品型号<input v-model="productScope" placeholder="多个型号以逗号分隔"></label><label>面向谁<input v-model="audience"></label></template>
+            <p v-else-if="!modelWikiInsight" class="support">资料不足也可建任务。核验手册或公告后，再审核适用范围与处理步骤。</p>
+            <label class="check"><input type="checkbox" v-model="insightDraft.confirmed">我已核对摘要并移除不必要的个人信息</label>
+            <button class="primary" :disabled="busy || !canCreateInsight(insightDraft)" @click="bridge">{{ busy ? '正在创建…' : modelWikiInsight ? '创建售后 Wiki 任务' : '创建内容任务' }}</button>
+          </section>
           <section v-else class="surface workflow-panel"><h2>从咨询到知识沉淀</h2>
             <ol class="steps">
               <li><span>确认咨询摘要</span><small>在一轮问答下选择「转为内容任务」。</small></li>
@@ -348,7 +433,11 @@ onBeforeUnmount(() => { eventsAbort?.abort(); clearInterval(refreshTimer); windo
               <li><span>发布并复问</span><small>查看客服是否引用了原文或直接复用 Wiki。</small></li>
             </ol>
           </section>
-          <section class="surface"><h2>实时语音</h2><p class="support">与文字客服共用商品知识。</p><button class="secondary" :disabled="busy" @click="voice">打开语音渠道</button></section>
+          <section class="surface"><h2>实时语音</h2>
+            <p class="support" role="status">{{ checkingVoice ? '正在检查语音状态…' : voiceChannelNotice(voiceAvailability) }}</p>
+            <p v-if="voiceError" class="error" role="alert">{{ voiceError }}</p>
+            <button class="secondary" :disabled="busy || checkingVoice || openingVoice" @click="voice">{{ openingVoice ? '正在打开…' : voiceReady ? '打开语音渠道' : '检查语音状态' }}</button>
+          </section>
         </aside>
       </div>
 

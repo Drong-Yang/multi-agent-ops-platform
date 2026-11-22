@@ -4,11 +4,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 import uuid
 from typing import Literal
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,15 +21,246 @@ from app.fusion.repository import RepositoryError, Conflict, Invalid, NotFound
 from app.fusion.runtime import public_task, public_asset, mode
 from app.fusion.privacy import sanitize
 from app.fusion.faq import select_faq_assets, describe_asset, hydrate_asset_topic
-from app.fusion.legacy_rag.commerce import direct_answer,retrieval_query
+from app.fusion.legacy_rag.commerce import direct_answer, normalize, retrieval_query
 from app.fusion.legacy_rag.llm_service import LLMService
+from app.fusion.legacy_rag.rag_service import terms
 from app.fusion.catalog_answers import catalog_quote
+from app.fusion.deepseek_support import (
+    DeepSeekUnavailable, answer_knowledge_gap, classify_dialogue_intent, deepseek_available,
+)
+from app.fusion.support_answers import (
+    answer_product_fit, answer_return_eligibility, answer_return_freight, combined_return_question,
+    explain_recommendation, mock_support_answer, recommend_product,
+    recommendation_needs_preferences, recommendation_preference_question, recommendation_requested,
+    return_eligibility_question, return_freight_question, return_status_reply,
+)
+from app.fusion.support_dialogue import dialogue_window, resolve_dialogue
 from app.fusion.knowledge_access import KnowledgeUnavailable, active_snapshot_id
 from app.fusion.support_wiki import WikiDraftInput, WikiReview, candidate_question, review_wiki, select_page
+from app.fusion.support_triage import safety_incident_answer
 from app.fusion.wiki_drafts import WikiDraftUnavailable, create_wiki_draft
 
 router=APIRouter(prefix='/api/v1',tags=['Fusion'])
 callbacks=APIRouter(prefix='/callbacks/rtc',tags=['RTC callbacks'])
+_NO_EVIDENCE = '这点我暂时无法从现有资料确认。您可以补充具体型号和想了解的问题，也可以在购买平台联系商家核实。'
+_INTRO = re.compile(
+    r'(?:你好|您好|请问){0,2}(?:(?:你|您)(?:是(?:谁|什么|什么助手|什么机器人|干嘛的)|叫(?:什么|啥)(?:名字)?|'
+    r'(?:有|会|能|可以)(?:帮我)?(?:做|干)?(?:什么|啥|嘛)(?:功能|用|事|忙)?)|'
+    r'(?:能|可以|请)?(?:介绍(?:一下)?(?:你自己|自己)|自我介绍(?:一下)?))(?:吗|呢)?'
+)
+_INTRO_REPLY = ('您好，我是星核数码的智能客服助手。您可以问我商品参数、选购建议、常见故障排查和售后流程。'
+                '查订单或办理退款，请通过购买平台的订单页操作。您想先了解哪一项？')
+_PRIVATE_ACTION = re.compile(
+    r'帮我(?:把钱退|把.{0,8}退款|取消订单|改地址|改收货|补发)|请把钱退给我|订单.{0,6}(?:查一下|现在什么状态)|'
+    r'我(?:的|这笔)订单|我(?:的|这笔)退款|扣我钱|从我账号.{0,5}(?:转账|付款)|'
+    r'你们(?:家|店|这里)?.{0,8}(?:客服电话|联系电话|门店地址|营业时间|今天价格|当前优惠|实时库存)'
+)
+_HAZARD_QUESTION = re.compile(r'爆炸|炸伤|起火|着火|冒.{0,2}烟|漏液|烫伤|触电|拆电池|短接电池')
+_SKU_TOKEN = re.compile(r'(?<![a-z0-9])(?:sc|ew)[ -]*[a-z]+[ -]*\d+[a-z]*', re.I)
+_VERIFY_RECOMMENDATION = re.compile(r'浸泡|浸水|泡水|潜水|落水|扔进水|飞机|航班|托运|登机')
+_POLICY_TOPICS = tuple(map(re.compile, (
+    r'退款|退钱|退回|退货|退换|无理由|拆[封包]|开封|能退|退吗',
+    r'发票|开票|抬头', r'发货|物流|快递|运单|签收|配送|没收到', r'运费|邮费|上门取件',
+    r'保修|质保|维修|返修|换新', r'平台介入|申诉|纠纷|投诉|赔付|赔偿',
+)))
+_POLICY_SUBJECT_REFERENCE = re.compile(r'^(?:(?:那(?:么)?|请问|我|这(?:一)?款|这个|它)[，、,\s]*)+')
+_SUPPORT_ISSUES = tuple(map(re.compile, (
+    r'断断续续|时断时续|断连|频繁断开|掉线|连接中断|卡顿|卡卡的',
+    r'只有(?:一边|一只|左耳|右耳)|一边.{0,6}(?:响|声音)|(?:单耳|单边).{0,6}(?:响|声音)|没声音|无声|不出声',
+    r'配对失败|配对不上|无法配对|连不上|连不起来|连接失败|无法连接|连接不上',
+    r'不充电|无法充电|充不进|充不上|充不了|不通电',
+    r'指示灯.{0,6}(?:异常|异样|一直闪|不亮)|不开机|无法开机|开不了机|死机|重启',
+    r'报错|错误码|故障码|升级失败|无法升级|更新失败',
+    r'不兼容|兼容问题|不识别|无法识别|识别不到',
+)))
+_GENERIC_TERMS = frozenset('怎么 如何 请问 什么 可以 能不 不能 是不 有没 没有 您好 你好 谢谢 '
+                          '我想 想问 一下 处理 平台 商品 产品 客服 商家 购买 对应 '
+                          '实际 具体 规则 问题 服务 情况 充电 电宝 耳机 手机 平板 电池'.split())
+_ANSWER_NOTICES = {
+    'assistant_intro': '本轮介绍客服身份和可提供的服务。',
+    'business_boundary': '本轮使用固定业务答复。',
+    'support_wiki': '本轮直接复用已审核的售后 Wiki。',
+    'catalog_quote': '本轮引用商品原文。',
+    'policy_quote': '本轮根据当前知识快照中的售后规则答复。',
+    'recommendation': '本轮根据商品资料给出选购建议。',
+    'no_evidence': '暂未找到与本轮问题匹配的资料。',
+    'model_assist': '知识库暂无可靠依据。本轮为 DeepSeek 提供的通用建议，尚待核验。',
+    'safety_incident': '本轮优先提供安全处置指引。',
+    'context_followup': '本轮结合当前会话中的问题和有效资料回答追问。',
+    'clarification': '需要确认咨询对象或选购偏好。',
+}
+
+
+def _answer_trace(route):
+    return {'status': route, 'message': _ANSWER_NOTICES[route], 'selected_assets': [], 'candidates': []}
+
+
+def _fixed_reply(rt, message, route, text):
+    result = {'sources': [], 'context': '', 'knowledge_snapshot_id': rt.knowledge.active_snapshot_id,
+              'answer_route': route, 'answer_model_skipped': True, 'direct_text': text, 'faq_reuse': _answer_trace(route)}
+    return [{'role': 'user', 'content': sanitize(message)}], result, [], ''
+
+
+def _policy_topics(text):
+    return {pattern for pattern in _POLICY_TOPICS if pattern.search(text)}
+
+
+def _relevant_sources(query, result, *, policy_only=False):
+    """Keep strong semantic hits and use topical overlap for borderline matches."""
+    question = query.rsplit('；追问：', 1)[-1]
+    informative = terms(_SKU_TOKEN.sub('', question)) - _GENERIC_TERMS
+    topics = _policy_topics(question)
+    issues = {pattern for pattern in _SUPPORT_ISSUES if pattern.search(question)}
+    sources = []
+    for source in result['sources']:
+        heading = source.get('source_section') or source.get('heading', '')
+        heading_topics = _policy_topics(heading) if source.get('kind') == 'rule' else set()
+        content = source.get('content', '')
+        if policy_only and (source.get('kind') != 'rule' or not topics & (heading_topics | _policy_topics(content))):
+            continue
+        title_overlap = informative & terms(_SKU_TOKEN.sub('', heading))
+        if heading_topics and not topics & heading_topics and len(title_overlap) < 2:
+            continue
+        issue_match = any(pattern.search(heading + '\n' + content) for pattern in issues)
+        if issues and not topics & heading_topics and not issue_match:
+            continue
+        content_overlap = informative & terms(_SKU_TOKEN.sub('', content))
+        score = source.get('score')
+        semantic = isinstance(score, (int, float)) and score >= 0.65
+        if semantic or issue_match or topics & heading_topics or title_overlap or len(content_overlap) >= 2:
+            sources.append(source)
+    return sources
+
+
+def _eligible_for_assistance(message, result):
+    return (result.get('retrieval_mode') not in ('unknown_sku', 'out_of_scope')
+            and not _PRIVATE_ACTION.search(message) and not _HAZARD_QUESTION.search(message))
+
+
+def _refresh_recommended_products(knowledge, snapshot_id, recent):
+    """Recover a known recommendation after an index upgrade and cite current facts."""
+    previous = next((turn for turn in reversed(recent) if turn.get('answer_route') == 'recommendation'), {})
+    old_id = previous.get('knowledge_snapshot_id')
+    refs = [source for source in previous.get('sources', []) if source.get('kind') == 'product']
+    if not old_id or old_id == snapshot_id or not refs:
+        return {}
+    try:
+        historic = knowledge.fact_bundle(old_id, refs)['evidence']
+        current = knowledge.fact_bundle(snapshot_id, [source['id'] for source in historic])['evidence']
+    except ValueError:
+        return {}
+    if [(source['sku'], source['kind']) for source in current] != [
+            (source['sku'], source['kind']) for source in historic]:
+        return {}
+    return {**previous, 'sources': current}
+
+
+def _dialogue_reply(knowledge, snapshot_id, dialogue, pages, message, *, voice=False, recommendation_query=''):
+    """Answer contextual requests using current evidence."""
+    intent = dialogue.intent
+    contextual_intents = ('reason', 'clarification', 'alternatives', 'product_followup', 'followup')
+    if intent in contextual_intents and not dialogue.anchor:
+        return 'clarification', '您想接着聊哪个商品或问题？告诉我关键词，我接着帮您看。', [], None
+    previous = dialogue.evidence_turn or {}
+    if not previous and intent in ('reason', 'clarification', 'product_followup', 'fit_check'):
+        previous = _refresh_recommended_products(knowledge, snapshot_id, dialogue.recent)
+    product_refs = [source for source in previous.get('sources', []) if source.get('kind') == 'product']
+    if intent == 'reason' and dialogue.requested_sku and not any(
+            normalize(source['sku']) == normalize(dialogue.requested_sku) for source in product_refs):
+        return 'clarification', '您问的是另一个型号吗？请确认想了解哪款的推荐理由。', [], None
+    legacy_group = (dialogue.group_reference and len(product_refs) > 1
+                    and dialogue.group_count in (None, len(product_refs))
+                    and (not dialogue.group_subject or all(
+                        dialogue.group_subject in source['source_section'] for source in product_refs)))
+    legacy_single = not dialogue.group_reference and len(product_refs) == 1
+    if dialogue.ambiguous_product_reference and not (
+            not dialogue.product_skus and (legacy_group or legacy_single)
+            and not dialogue.ordinal_reference and intent in ('product_followup', 'fit_check')):
+        options = '、'.join(dialogue.product_skus or [source['sku'] for source in product_refs])
+        if dialogue.group_reference:
+            prompt = (f'刚才列出了 {options}。您想比较这几款，还是有其他型号？'
+                      if options else '您想比较哪些商品？可以告诉我型号。')
+        else:
+            prompt = f'刚才提到了 {options}。您想了解哪一款？' if options else '您想了解哪一款？可以告诉我商品型号。'
+        return 'clarification', prompt, [], None
+    if dialogue.anchor and dialogue.anchor.get('answer_route') == 'safety_incident':
+        advice = safety_incident_answer(dialogue.topic_query, ())
+        if advice:
+            return 'safety_incident', advice, [], None
+    if dialogue.anchor and dialogue.anchor.get('answer_route') == 'business_boundary':
+        boundary = direct_answer(dialogue.topic_query)
+        if boundary:
+            return 'business_boundary', boundary, [], None
+    if intent == 'ambiguous':
+        return 'clarification', '您想接着问刚才哪一点？也可以告诉我想聊的新问题。', [], None
+    if intent in ('reason', 'clarification', 'alternatives', 'fit_check') and dialogue.recommendation_pending:
+        prompt = recommendation_preference_question(dialogue.topic_query)
+        return 'clarification', '我可以按您的实际需求筛选。' + prompt, [], None
+    if intent == 'fit_check':
+        if dialogue.requested_sku:
+            requested = normalize(dialogue.requested_sku)
+            product_refs = [chunk['id'] for chunk in knowledge.snapshot(snapshot_id)['corpus']['chunks']
+                            if chunk.get('kind') == 'product' and normalize(chunk.get('sku', '')) == requested]
+        elif dialogue.sku:
+            product_refs = [source for source in product_refs if source['sku'] == dialogue.sku]
+        if len(product_refs) != 1:
+            return 'clarification', '您想核对哪个型号能不能放进去？', [], None
+        evidence = knowledge.fact_bundle(snapshot_id, product_refs)['evidence']
+        answer = answer_product_fit(f'{message}。{dialogue.topic_query}', evidence)
+        if answer:
+            return 'context_followup' if dialogue.anchor else 'catalog_quote', answer, evidence, None
+        return 'clarification', '当前商品资料缺少完整尺寸。您可以核对商品详情页上的长、宽和厚度。', [], None
+    if intent == 'product_followup' and product_refs:
+        selected = [source for source in product_refs if source['sku'] == dialogue.sku] if dialogue.sku else product_refs
+        try:
+            evidence = knowledge.fact_bundle(snapshot_id, selected)['evidence']
+        except ValueError:
+            evidence = []
+        quote = catalog_quote(message, {'retrieval_mode': 'catalog_exact', 'sources': evidence}, voice=voice)
+        if quote is not None:
+            answer, sources = quote
+            return ('catalog_quote' if sources else 'no_evidence'), answer, sources, None
+    if intent not in ('reason', 'clarification', 'alternatives'):
+        return None
+
+    original = dialogue.topic_query
+    is_recommendation = recommendation_requested(original)
+    is_recommendation_reply = previous.get('answer_route') in ('recommendation', 'context_followup')
+    if intent == 'alternatives':
+        if not is_recommendation:
+            return 'clarification', '您想看其他商品，还是想了解其他处理办法？', [], None
+        catalogue = knowledge.snapshot(snapshot_id)['corpus']['chunks']
+        shown = dialogue.seen_skus
+        answer, products = recommend_product(recommendation_query, catalogue, excluded_skus=shown)
+        if not products:
+            return 'context_followup', '同样条件下，现有资料里没有新的合适型号。您更愿意调整预算，还是调整用途和功能要求？', [], None
+        evidence = knowledge.fact_bundle(snapshot_id, [product['id'] for product in products])['evidence']
+        return 'recommendation', answer, evidence, None
+
+    if is_recommendation and is_recommendation_reply and product_refs:
+        if dialogue.sku:
+            product_refs = [source for source in product_refs if source['sku'] == dialogue.sku]
+        elif dialogue.requested_sku:
+            product_refs = [source for source in product_refs if normalize(source['sku']) == normalize(dialogue.requested_sku)]
+        try:
+            evidence = knowledge.fact_bundle(snapshot_id, product_refs)['evidence']
+        except ValueError:
+            return None
+        criteria = previous.get('recommendation_query') or previous.get('question', '')
+        explained = explain_recommendation(criteria if recommendation_requested(criteria) else original, evidence,
+                                           clarify=intent == 'clarification')
+        if explained:
+            answer, sources = explained
+            return 'context_followup', answer, sources, None
+    if is_recommendation and dialogue.anchor.get('answer_route') == 'recommendation' and not product_refs:
+        return 'clarification', '您想了解刚才哪款商品的推荐理由？告诉我型号，我可以按当前资料重新核对。', [], None
+    wiki_id = previous.get('wiki_asset_id')
+    page = next((page['payload'] for page in pages if page['id'] == wiki_id), None) if wiki_id else None
+    if page:
+        wiki = page['wiki']
+        answer = f'这条说明适用于{wiki["scope"]}。{wiki["answer"]}' if intent == 'reason' else wiki['answer']
+        return 'context_followup', answer, page['evidence_refs'], wiki_id
+    return None
 
 
 class Input(BaseModel):
@@ -89,53 +322,174 @@ async def active_id(rt):
 
 
 async def prepare_answer(rt,session,message):
+    turns = session['payload'].get('turns', [])
+    safety = safety_incident_answer(message, turns[-2:])
+    if safety:
+        # A product-safety reply must still be delivered during a knowledge-service outage.
+        return _fixed_reply(rt, message, 'safety_incident', safety)
+    if _INTRO.fullmatch(normalize(message)):
+        return _fixed_reply(rt, message, 'assistant_intro', _INTRO_REPLY)
+    fixed = direct_answer(message)
+    if fixed:
+        return _fixed_reply(rt, message, 'business_boundary', fixed)
+    if _PRIVATE_ACTION.search(message):
+        return _fixed_reply(rt, message, 'business_boundary',
+                            '请通过购买平台的订单页核对实时信息、办理业务或联系商家人工客服。')
+
     snapshot_id = await active_id(rt)
     owner = session['owner_id']
-    previous = session['payload'].get('turns', [])[-2:]
     available = await rt.db('valid_faq', owner)
     valid_ids = {a['id'] for a in available if a['payload'].get('knowledge_snapshot_id') == snapshot_id}
-    pages = await rt.db('valid_wiki', owner) if candidate_question(message) or any(t.get('wiki_asset_id') for t in previous) else []
+    recent_turns = dialogue_window(turns)
+    needs_wiki = candidate_question(message) or _policy_topics(message) or any(
+        t.get('wiki_asset_id') for t in recent_turns)
+    pages = await rt.db('valid_wiki', owner) if needs_wiki else []
     wiki_ids = {page['id'] for page in pages if page['payload']['knowledge_snapshot_id'] == snapshot_id}
+    evidence_state = {'valid_faq_ids': valid_ids, 'valid_wiki_ids': wiki_ids}
+    dialogue = resolve_dialogue(message, recent_turns, snapshot_id, **evidence_state)
+    classification = None
+    if (dialogue.intent == 'ambiguous' and dialogue.anchor
+            and dialogue.anchor.get('answer_route') not in ('safety_incident', 'business_boundary')
+            and mode() == 'live' and deepseek_available()):
+        classification = await classify_dialogue_intent(message, dialogue.topic_query)
+        if classification:
+            dialogue = resolve_dialogue(message, recent_turns, snapshot_id,
+                                        intent_override=classification, **evidence_state)
+    previous = [dialogue.recent[0], dialogue.recent[-1]] if len(dialogue.recent) > 2 else list(dialogue.recent)
     history = []
     for turn in previous:
         history.append({'role':'user', 'content':turn['question']})
-        if (turn.get('knowledge_snapshot_id') == snapshot_id and set(turn.get('faq_asset_ids', [])).issubset(valid_ids)
+        if (turn.get('answer_route') != 'model_assist' and turn.get('knowledge_snapshot_id') == snapshot_id
+                and set(turn.get('faq_asset_ids', [])).issubset(valid_ids)
                 and (not turn.get('wiki_asset_id') or turn['wiki_asset_id'] in wiki_ids)):
             history.append({'role':'assistant', 'content':turn['answer']})
-    history.append({'role':'user', 'content':sanitize(message)})
+    current_question = sanitize(message)
+    if dialogue.policy_subject:
+        current_question = dialogue.policy_subject + _POLICY_SUBJECT_REFERENCE.sub('', current_question)
+    history.append({'role':'user', 'content':current_question})
     query = retrieval_query(history)
+    if dialogue.intent == 'product_followup' and dialogue.product_skus:
+        products = dialogue.sku or ' '.join(dialogue.product_skus)
+        query = f'{products}；追问：{history[-1]["content"]}'
+    elif dialogue.policy_subject:
+        query = current_question
+    elif dialogue.anchor and dialogue.intent in ('reason', 'clarification'):
+        query = dialogue.topic_query
+    elif dialogue.anchor and query == history[-1]['content']:
+        query = f'{dialogue.topic_query}；追问：{history[-1]["content"]}'
+    recommendation_query = sanitize(message)
+    if dialogue.intent in ('preferences', 'alternatives') and recommendation_requested(dialogue.topic_query):
+        recommendation_query = f'{recommendation_query}。{dialogue.topic_query}'
     voice = session['payload'].get('channel') == 'voice'
-    fixed = direct_answer(message)
-    wiki = select_page(pages, message, snapshot_id)
-    if fixed:
-        result = {'sources':[], 'context':'', 'knowledge_snapshot_id':snapshot_id}
-        route = 'business_boundary'
-    elif wiki:
+    wiki = select_page(pages, current_question, snapshot_id)
+    return_context = dialogue.intent == 'policy_followup' and dialogue.anchor and dialogue.anchor.get('answer_route') == 'policy_quote'
+    combined_return = combined_return_question(message)
+    return_eligibility = combined_return or return_eligibility_question(message) or (return_context and return_status_reply(message))
+    return_freight = combined_return or return_freight_question(message, related=bool(return_context))
+    may_assist = False
+    if wiki:
         payload = wiki['payload']
         fixed = payload['wiki']['answer']
         result = {'sources':payload['evidence_refs'], 'context':'', 'knowledge_snapshot_id':snapshot_id,
                   'wiki_asset_id':wiki['id']}
         route = 'support_wiki'
+    elif return_eligibility or return_freight:
+        catalogue = rt.knowledge.snapshot(snapshot_id)['corpus']['chunks']
+        fixed, rules = '', []
+        if return_eligibility:
+            fixed, rules = answer_return_eligibility(message, catalogue, ask_status=not return_freight)
+        if return_freight:
+            freight, freight_rules = answer_return_freight(catalogue)
+            fixed += freight
+            rules.extend(freight_rules)
+        sources = rt.knowledge.fact_bundle(snapshot_id, [rule['id'] for rule in rules])['evidence'] if rules else []
+        result = {'sources': sources, 'context': '', 'knowledge_snapshot_id': snapshot_id}
+        route = 'policy_quote' if sources else 'no_evidence'
+    elif followup := _dialogue_reply(rt.knowledge, snapshot_id, dialogue, pages, message, voice=voice,
+                                    recommendation_query=recommendation_query):
+        route, fixed, sources, wiki_id = followup
+        result = {'sources': sources, 'context': '', 'knowledge_snapshot_id': snapshot_id}
+        if wiki_id:
+            result['wiki_asset_id'] = wiki_id
+        if route == 'recommendation' and dialogue.intent == 'alternatives':
+            result['recommendation_query'] = recommendation_query
+    elif recommendation_requested(recommendation_query):
+        catalogue = rt.knowledge.snapshot(snapshot_id)['corpus']['chunks']
+        fixed, selected_products = recommend_product(recommendation_query, catalogue)
+        sources = rt.knowledge.fact_bundle(snapshot_id, [item['id'] for item in selected_products])['evidence']
+        result = {'sources':sources, 'context':'', 'knowledge_snapshot_id':snapshot_id}
+        if dialogue.intent == 'preferences':
+            result['recommendation_query'] = recommendation_query
+        if not sources and recommendation_needs_preferences(recommendation_query):
+            route = 'clarification'
+            result['recommendation_pending'] = True
+        else:
+            route = 'recommendation' if sources else 'no_evidence'
+            may_assist = (not sources and dialogue.intent != 'preferences' and not _SKU_TOKEN.search(message)
+                          and not _VERIFY_RECOMMENDATION.search(message))
     else:
-        result = await asyncio.wait_for(rt.knowledge.retrieve(query, snapshot_id=snapshot_id), timeout=5)
+        retrieval_unavailable = False
+        try:
+            result = await asyncio.wait_for(rt.knowledge.retrieve(query, snapshot_id=snapshot_id), timeout=5)
+        except (TimeoutError, httpx.HTTPError, RuntimeError):
+            if mode() == 'mock':
+                raise
+            retrieval_unavailable = True
+            result = {'sources': [], 'context': '', 'knowledge_snapshot_id': snapshot_id}
         quote = catalog_quote(message, result, voice=voice)
         if quote is not None:
             fixed, result['sources'] = quote
             result['context'] = ''
             route = 'catalog_quote' if result['sources'] else 'no_evidence'
-        elif not result['sources']:
-            fixed = '目前没有这项信息，我无法确认。请补充准确的商品型号，或通过购买平台联系人工客服核实。'
-            route = 'no_evidence'
+        elif mode() == 'mock':
+            fixed, result['sources'] = (mock_support_answer(query, result['sources'])
+                                        if result['sources'] else (_NO_EVIDENCE, []))
+            result['context'] = ''
+            route = 'rag' if result['sources'] else 'no_evidence'
         else:
-            route = 'rag'
+            relevant = _relevant_sources(query, result, policy_only=dialogue.intent == 'policy_followup')
+            if relevant:
+                if relevant != result['sources']:
+                    result['sources'] = relevant
+                    result['context'] = '\n\n'.join(
+                        f'[来源：{source["source"]}；章节：{source["source_section"]}]\n{source["content"]}'
+                        for source in relevant
+                    )
+                    result['retrieved_context'] = result['context']
+                route = 'rag'
+            else:
+                result.update(sources=[], context='', retrieved_context='', knowledge_gap=True)
+                route, fixed = 'no_evidence', _NO_EVIDENCE
+                if retrieval_unavailable:
+                    fixed = '资料检索暂时不可用。您可以稍后重试，或在购买平台联系商家核实。'
+                may_assist = True
+    model_attempted = (may_assist and mode() == 'live' and _eligible_for_assistance(message, result)
+                       and deepseek_available())
+    if model_attempted:
+        result['knowledge_gap'] = True
+        current = history[-1]['content']
+        try:
+            async with asyncio.timeout(9 if voice else 16):
+                answer = await answer_knowledge_gap(current, previous if query != current else ())
+        except (DeepSeekUnavailable, TimeoutError):
+            if fixed == _NO_EVIDENCE:
+                fixed = '暂时无法给出可靠建议。您可以补充详细情况再试，或在购买平台联系商家核实。'
+        else:
+            route, fixed = 'model_assist', answer
+            result['answer_model'] = 'deepseek-flash'
     selected = []
     if route == 'rag':
         selected, trace = await select_faq_assets(rt, owner, message, query, result, candidates=available)
+        if fixed and selected:
+            trace['message'] = f'{len(selected)} 份已审 FAQ 与本轮匹配。本轮演示答复基于原始资料。'
     else:
-        labels = {'business_boundary':'本轮使用固定业务答复。', 'support_wiki':'本轮直接复用已审核的售后 Wiki。',
-                  'catalog_quote':'本轮引用商品原文。', 'no_evidence':'原始资料不足或没有匹配的商品参数。'}
-        trace = {'status':route, 'message':labels[route], 'selected_assets':[], 'candidates':[]}
-    result.update(faq_reuse=trace, answer_route=route, answer_model_skipped=bool(fixed))
+        trace = _answer_trace(route)
+    result.update(faq_reuse=trace, answer_route=route, answer_model_skipped=bool(fixed) and not model_attempted,
+                  dialogue_intent=dialogue.intent)
+    if classification:
+        result['dialogue_intent_source'] = 'model'
+    if dialogue.anchor and dialogue.anchor.get('turn_id'):
+        result['follow_up_to_turn_id'] = dialogue.anchor['turn_id']
     if fixed:
         result['direct_text'] = fixed
     context = result['context']
@@ -169,7 +523,13 @@ async def answer_chunks(rt,session,message):
           'sources':result['sources'],'knowledge_snapshot_id':result['knowledge_snapshot_id'],
           'faq_asset_ids':[a['id'] for a in selected],'faq_reuse':result['faq_reuse'],'mode':mode(),
           'answer_route':result['answer_route'],'answer_model_skipped':result['answer_model_skipped'],
-          'wiki_asset_id':result.get('wiki_asset_id'), 'wiki_candidate':candidate_question(message)}
+          'wiki_asset_id':result.get('wiki_asset_id'),
+          'wiki_candidate':result['answer_route'] not in ('safety_incident', 'assistant_intro', 'business_boundary')
+                            and candidate_question(message)}
+    for field in ('answer_model', 'knowledge_gap', 'dialogue_intent', 'dialogue_intent_source',
+                  'follow_up_to_turn_id', 'recommendation_pending', 'recommendation_query'):
+        if field in result:
+            turn[field] = result[field]
     # A concurrent turn can't silently overwrite this one.
     for attempt in range(3):
         current=await rt.db('get',session['id'],session['owner_id'],'consultation')
@@ -286,16 +646,19 @@ def create_wiki_task(tx, knowledge, owner, insight, topic, sid):
     origin = insight['payload']
     session = tx.get(origin['session_id'], owner, 'consultation')
     turn = next((item for item in session['payload']['turns'] if item['turn_id'] == origin['turn_id']), None)
-    if not turn or not candidate_question(turn['question']):
+    assisted = bool(turn and turn.get('answer_route') == 'model_assist')
+    if (not turn or turn.get('answer_route') in ('safety_incident', 'assistant_intro', 'business_boundary')
+            or (assisted and turn.get('wiki_candidate') is not True) or not candidate_question(turn['question'])):
         raise Invalid('请选择问题明确、可独立说明的售后咨询轮次')
     evidence = []
-    if origin['knowledge_snapshot_id'] == sid:
+    if not assisted and origin['knowledge_snapshot_id'] == sid:
         refs = [item for item in origin['evidence_refs'] if item.get('kind') != 'wiki_evidence']
         evidence = knowledge.fact_bundle(sid, refs)['evidence']
     task = tx.create('task', owner, {
         'content_type':'wiki', 'status':'waiting_human', 'topic_direction':topic, 'knowledge_snapshot_id':sid,
         'source':{'insight_id':insight['id'], 'session_id':origin['session_id'], 'turn_id':origin['turn_id']},
         'source_question':turn['question'], 'source_answer':turn['answer'][:800], 'source_answer_route':turn.get('answer_route'),
+        **({'source_answer_model': turn.get('answer_model')} if assisted else {}),
         'evidence_refs':evidence, 'values':{},
     }, source_id=insight['id'])
     return public_task(task)

@@ -7,16 +7,17 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import uuid
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from app.dependencies.auth import get_current_user
 from app.core.security import decode_access_token
 from app.fusion.repository import Repository, RepositoryError
-from app.fusion.voice_gateway import router, event_callbacks
+from app.fusion.voice_gateway import router, event_callbacks, _voice_page_ready
 
 
 class FakeController:
@@ -96,6 +97,50 @@ class VoiceGatewayTests(unittest.TestCase):
     def proxy(self, headers, scene, action):
         return self.client.post("/api/v1/voice/legacy/proxy?Action=" + action,
                                 headers=headers, json={"SceneID": scene})
+
+    def test_availability_requires_operator_login_and_skips_voice_probe_in_mock(self):
+        path = "/api/v1/voice/availability"
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.controller.config.MOCK_MODE = True
+        with patch('httpx.AsyncClient', side_effect=AssertionError('mock mode should not probe the voice page')):
+            response = self.client.get(path, headers={"Authorization": "Bearer operator-alice"})
+        self.assertEqual(response.json(), {"ready": False, "reason": "mock_mode"})
+
+    def test_availability_distinguishes_configuration_and_voice_page(self):
+        path = "/api/v1/voice/availability"
+        headers = {"Authorization": "Bearer operator-alice"}
+        with patch('app.fusion.voice_gateway.validate_voice_settings'):
+            self.controller.config.SERVER_URL = ""
+            self.assertEqual(self.client.get(path, headers=headers).json(), {"ready": False, "reason": "configuration"})
+            self.controller.config.SERVER_URL = "https://voice.example.test"
+            with patch('app.fusion.voice_gateway._voice_page_ready', new=AsyncMock(side_effect=[False, True])):
+                self.assertEqual(self.client.get(path, headers=headers).json(), {"ready": False, "reason": "voice_ui_unavailable"})
+                self.assertEqual(self.client.get(path, headers=headers).json(), {"ready": True, "reason": "ready"})
+
+    def test_guarded_handoff_does_not_issue_a_code_when_voice_page_disappears(self):
+        with patch('app.fusion.voice_gateway._availability_reason', new=AsyncMock(return_value='voice_ui_unavailable')):
+            response = self.client.post('/api/v1/voice/handoff?require_ready=true',
+                                        headers={'Authorization': 'Bearer operator-alice'})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()['detail']['reason'], 'voice_ui_unavailable')
+        self.assertEqual(self.repo.scan('voice_handoff'), [])
+
+    def test_voice_page_probe_rejects_other_listeners_and_redirects(self):
+        responses = (
+            (httpx.Response(200, text='<html>another local site</html>'), False),
+            (httpx.Response(302, headers={'Location': 'http://127.0.0.1:8010/health'}), False),
+            (httpx.Response(200, json={'service': 'commerce-fusion-voice'}), True),
+        )
+        for response, expected in responses:
+            with self.subTest(status=response.status_code, expected=expected):
+                def serve(request):
+                    self.assertEqual(str(request.url), 'http://127.0.0.1:5179/fusion-voice-page.json')
+                    self.assertNotIn('authorization', request.headers)
+                    return response
+
+                client = httpx.AsyncClient(transport=httpx.MockTransport(serve))
+                with patch('app.fusion.voice_gateway.httpx.AsyncClient', return_value=client):
+                    self.assertEqual(asyncio.run(_voice_page_ready()), expected)
 
     def test_handoff_is_once_only_and_capability_is_not_operator_jwt(self):
         code, headers = self.capability()

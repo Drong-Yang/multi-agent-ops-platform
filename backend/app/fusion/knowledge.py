@@ -17,6 +17,7 @@ from .legacy_rag.rag_service import RagService
 PROJECT = Path(__file__).resolve().parents[3]
 BACKEND = PROJECT / "backend"
 DEFAULT_SNAPSHOTS = PROJECT / "knowledge" / "snapshots"
+DEFAULT_CORPUS = "ecommerce-v2.json"
 
 
 def digest(value) -> str:
@@ -38,16 +39,19 @@ class KnowledgeService:
         self.directory = self.directory.resolve()
         self._snapshots = {}
         self._retrievers = {}
+        preferred = None
         for path in sorted(self.directory.glob("*.json")):
             data = json.loads(path.read_text(encoding="utf-8"))
             if "chunks" in data and "documents" in data:
-                self._add(data)
+                identity = self._add(data)
+                if path.name == DEFAULT_CORPUS:
+                    preferred = identity
             elif "corpus" in data:
                 self._load_manifest(data)
         if not self._snapshots:
-            baseline = json.loads((DEFAULT_SNAPSHOTS / "ecommerce-v1.json").read_text(encoding="utf-8"))
-            self._add(baseline)
-        self._active_snapshot_id = next(iter(self._snapshots))
+            baseline = json.loads((DEFAULT_SNAPSHOTS / DEFAULT_CORPUS).read_text(encoding="utf-8"))
+            preferred = self._add(baseline)
+        self._active_snapshot_id = preferred or next(iter(self._snapshots))
 
     def _profile(self):
         config = self.config

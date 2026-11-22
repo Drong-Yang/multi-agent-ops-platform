@@ -146,17 +146,19 @@ class KnowledgeReadinessContracts(unittest.IsolatedAsyncioTestCase):
 
     async def test_milvus_readiness_checks_existing_schema_and_active_scope_count(self):
         service = self.service()
+        count = len(service.snapshot()["corpus"]["chunks"])
         with patch.object(MilvusService, "request", AsyncMock(return_value=self.description())), \
-             patch.object(MilvusService, "count", AsyncMock(return_value=89)):
+             patch.object(MilvusService, "count", AsyncMock(return_value=count)):
             result = await service.ensure_ready()
         self.assertTrue(result["ready"])
-        self.assertEqual(result["active_records"], 89)
+        self.assertEqual(result["active_records"], count)
         self.assertEqual(service.snapshot()["status"], "ready")
 
     async def test_milvus_count_mismatch_does_not_activate_or_fallback(self):
         service = self.service()
+        count = len(service.snapshot()["corpus"]["chunks"])
         with patch.object(MilvusService, "request", AsyncMock(return_value=self.description())), \
-             patch.object(MilvusService, "count", AsyncMock(return_value=88)), \
+             patch.object(MilvusService, "count", AsyncMock(return_value=count - 1)), \
              self.assertRaisesRegex(RuntimeError, "未就绪"):
             await service.ensure_ready()
         self.assertNotEqual(service.snapshot()["status"], "ready")
@@ -169,9 +171,10 @@ class KnowledgeReadinessContracts(unittest.IsolatedAsyncioTestCase):
     async def test_sync_only_writes_fusion_collection_and_does_not_change_active(self):
         service = self.service()
         old = service.active_snapshot_id
-        with patch.object(MilvusService, "sync", AsyncMock(return_value={"count": 89})) as sync, \
+        count = len(service.snapshot()["corpus"]["chunks"])
+        with patch.object(MilvusService, "sync", AsyncMock(return_value={"count": count})) as sync, \
              patch.object(MilvusService, "request", AsyncMock(return_value=self.description())), \
-             patch.object(MilvusService, "count", AsyncMock(return_value=89)):
+             patch.object(MilvusService, "count", AsyncMock(return_value=count)):
             result = await service.sync_snapshot()
         self.assertTrue(result["ready"])
         sync.assert_awaited_once()

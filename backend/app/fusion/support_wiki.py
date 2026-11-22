@@ -9,14 +9,22 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 from .legacy_rag.commerce import direct_answer
 from .privacy import sanitize
 from .repository import Conflict, Invalid, content_hash
+from .support_triage import safety_incident_answer
 
 _AFTER_SALES = re.compile(
     r'故障|报错|错误码|维修|固件|升级失败|连接不上|无法连接|无法配对|配对失败|不兼容|兼容问题|'
     r'无法充电|充不进|充不了|没声音|无声音|不能开机|无法开机|死机|保修|质保|售后|退货|拆封|拆包|开封|拆过包装|'
     r'能退|可以退|退吗|退不了|无理由|运费|退换|不能连接|不通电'
 )
-_REFERENTIAL = re.compile(r'^(那|这个|这款|它|刚才|上面|我的|我这)')
+_REFERENTIAL = re.compile(r'^(那|这个|这款|它|刚才|上面|我这)')
 _MODEL = re.compile(r'(?<![a-z0-9])(?:sc|ew)[ -]*[a-z]+[ -]*[0-9]+[a-z]*(?![a-z0-9])', re.I)
+_SUPPORT_DEVICE = re.compile(r'耳机|充电宝|移动电源|充电器|数据线|手机|平板|电脑|键盘|鼠标|手表|音箱|扩展坞|设备')
+_SUPPORT_ISSUE = re.compile(
+    r'自动断开|断连|掉线|信号不稳|连接不稳|耗电快|电量掉得快|电池衰减|指示灯.{0,4}(?:闪|不亮)|'
+    r'只有一边.{0,4}有声|只响一边|[一单][边侧].{0,4}没声|声音小|杂音|电流声|延迟|'
+    r'清洁|清理|(?:怎么|如何).{0,12}(?:配对|连接|重置|恢复出厂|更新|识别)'
+)
+_INTERMITTENT_HARDWARE = re.compile(r'蓝牙|耳机|音箱|键盘|鼠标|信号|连接')
 
 
 def question_key(text):
@@ -26,11 +34,16 @@ def question_key(text):
 
 def candidate_question(text):
     text = text.strip()
-    return bool(text and sanitize(text) == text and not direct_answer(text)
-                and _AFTER_SALES.search(text) and not _REFERENTIAL.match(text)
+    has_device = _SUPPORT_DEVICE.search(text) or _MODEL.search(text)
+    setup_or_symptom = has_device and (_SUPPORT_ISSUE.search(text) or (
+        '断断续续' in text and _INTERMITTENT_HARDWARE.search(text)
+    ))
+    return bool(4 <= len(text) <= 200 and sanitize(text) == text and not direct_answer(text)
+                and (_AFTER_SALES.search(text) or setup_or_symptom) and not _REFERENTIAL.match(text)
+                and (not text.startswith('我的') or has_device) and not safety_incident_answer(text, ())
                 and not re.search(r'\[(?:[A-Z_]+_)?REDACTED\]', text)
                 and not re.search(r'多重|净重|重量|尺寸|价格|多少钱|售价|包装清单|满减', text)
-                and not any(ch in text for ch in ('\n', '\r', ';', '；')) and len(text) <= 200)
+                and not any(ch in text for ch in ('\n', '\r', ';', '；')))
 
 
 def model_tokens(text):
@@ -96,6 +109,11 @@ class WikiSuggestion(BaseModel):
 
 
 def wiki_evidence(repo, knowledge, task_payload, evidence_ids, supplement):
+    if task_payload.get('source_answer_route') == 'model_assist':
+        if not supplement:
+            raise Invalid('模型辅助回答需补充独立资料，例如官方手册或公告的 HTTPS 出处与原文摘录')
+        if evidence_ids:
+            raise Invalid('模型辅助回答的 Wiki 请使用补充的独立资料')
     active = repo.get_active_snapshot()
     if not active:
         raise Conflict('当前没有可核对的知识快照')

@@ -23,7 +23,8 @@ foreach ($fusionPort in @(8010,8011,5178,5179,4041)) {
         throw "端口 $fusionPort 已被占用。若为本工程，请先运行 .\stop-voice.cmd；其他应用请自行关闭或调整端口。"
     }
 }
-if (-not (Test-Path -LiteralPath (Join-Path $fusionRoot 'frontend-voice\build\index.html'))) {
+if (-not (Test-Path -LiteralPath (Join-Path $fusionRoot 'frontend-voice\build\index.html')) -or
+    -not (Test-Path -LiteralPath (Join-Path $fusionRoot 'frontend-voice\build\fusion-voice-page.json'))) {
     throw '语音前端尚未构建。请在 frontend-voice 运行 npm run build 后重试。'
 }
 $fusionRuntime = Join-Path $fusionRoot '.runtime'
@@ -58,15 +59,21 @@ try {
     $env:EMBEDDING_TIMEOUT = '10'
     & (Join-Path $fusionRoot 'start.ps1') -Live -WithVector
     $fusionDeadline = (Get-Date).AddSeconds(60)
-    $fusionReady = $false
+    $fusionBackendReady = $false
+    $fusionVoiceReady = $false
     while ((Get-Date) -lt $fusionDeadline) {
         try {
             $fusionHealth = Get-FusionHealth
-            if ($fusionHealth.service -eq '电商运营Agent' -and $fusionHealth.mock -eq $false -and $fusionHealth.retrieval_mode -eq 'milvus') { $fusionReady = $true; break }
+            if ($fusionHealth.service -eq '电商运营Agent' -and $fusionHealth.mock -eq $false -and $fusionHealth.retrieval_mode -eq 'milvus') {
+                $fusionBackendReady = $true
+                $fusionVoicePage = Get-FusionHealth -Uri 'http://127.0.0.1:5179/fusion-voice-page.json'
+                if ($fusionVoicePage.service -eq 'commerce-fusion-voice') { $fusionVoiceReady = $true; break }
+            }
         } catch {}
         Start-Sleep -Milliseconds 500
     }
-    if (-not $fusionReady) { throw '真实模型/Milvus 服务未就绪。请检查 .runtime/backend-error.log；不会自动重建向量库或切换模拟模式。' }
+    if (-not $fusionBackendReady) { throw '真实模型/Milvus 服务未就绪。请检查 .runtime/backend-error.log；不会自动重建向量库或切换模拟模式。' }
+    if (-not $fusionVoiceReady) { throw '语音页面未就绪。请检查 .runtime/voice-error.log，或重新构建 frontend-voice。' }
     Write-Output '语音手测环境就绪：http://127.0.0.1:5178。登录后点击“打开语音渠道”，再点击“通话”。'
     Write-Output '尚未自动拨打通话。测试结束先挂断，再运行 .\stop-voice.cmd；可加 -StopInfrastructure 停止容器。'
 } catch {

@@ -121,6 +121,48 @@ class SupportWikiTests(unittest.IsolatedAsyncioTestCase):
                 self.review(task, draft)
         self.assertEqual(self.repo.list('asset', 'alice'), [])
 
+    def test_natural_troubleshooting_can_become_a_wiki_question(self):
+        from app.fusion.support_wiki import candidate_question
+
+        for question in (
+            '蓝牙耳机在无线设备很多的地方老是断断续续，有哪些通用的排查方法？',
+            '我的耳机只有一边有声音，该怎么查？',
+            '为什么平板连着蓝牙键盘会掉线？',
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(candidate_question(question))
+
+        for question in ('你会做什么？', '电脑上的直播怎么总是断断续续？', '这款为什么断断续续？',
+                         '耳机开始冒烟，售后可以处理吗？', '拍的电影为什么总是断断续续？'):
+            with self.subTest(question=question):
+                self.assertFalse(candidate_question(question))
+
+    def test_model_assisted_turn_requires_independent_source_before_approval(self):
+        from app.fusion.repository import Invalid
+        from app.fusion.support_wiki import select_page
+
+        task = self.task()
+        question = '蓝牙耳机老是断断续续，怎么排查？'
+        chunk_id = self.knowledge.snapshot()['corpus']['chunks'][0]['id']
+        task = self.repo.update_cas(task['id'], 'alice', task['state_version'], {
+            **task['payload'], 'source_question': question,
+            'source_answer_route': 'model_assist', 'source_answer': '这是待核验的模型补答。',
+            'evidence_refs': self.knowledge.fact_bundle(self.snapshot, [chunk_id])['evidence'],
+        })
+        with self.assertRaisesRegex(Invalid, '独立资料'):
+            self.review(task, self.draft(question=question, expected_state_version=task['state_version'],
+                                         supplement=None, evidence_ids=[chunk_id]))
+        self.assertEqual(self.repo.list('asset', 'alice'), [])
+
+        _, asset = self.review(task, self.draft(question=question, expected_state_version=task['state_version']))
+        payload = asset['payload']
+        self.assertEqual(payload['publication_status'], 'draft')
+        self.assertEqual(payload['evidence_refs'][0]['source'], 'https://support.example.com/manual')
+        self.assertNotIn('待核验的模型补答', repr(payload))
+        self.assertIsNone(select_page(self.repo.valid_wiki('alice'), question, self.snapshot))
+        self.repo.publish(asset['id'], 'alice', asset['state_version'])
+        self.assertEqual(select_page(self.repo.valid_wiki('alice'), question, self.snapshot)['id'], asset['id'])
+
     def test_generated_prefill_repairs_question_scope_and_prunes_invalid_aliases(self):
         from app.fusion.support_wiki import WikiDraftInput, WikiSuggestion, prepare_wiki_review
         source = 'SC-PB27 无法连接怎么办？'

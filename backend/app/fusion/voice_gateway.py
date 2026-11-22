@@ -4,6 +4,7 @@ An operator JWT creates a one-use handoff. Its exchanged opaque capability can
 only control one bound voice session, never an operator API or another session.
 Database transitions are short CAS operations; cloud calls happen outside them.
 """
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -15,18 +16,22 @@ import uuid
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.dependencies.auth import get_current_user
+from app.core.config import settings
 from app.fusion import api
 from app.fusion.privacy import sanitize
 from app.fusion.repository import Conflict, NotFound
 from app.fusion.rtc_control import RtcController
+from app.fusion.startup import validate_voice_settings
 
 router = APIRouter(prefix="/api/v1/voice", tags=["Voice gateway"])
 event_callbacks = APIRouter(prefix="/callbacks/rtc", tags=["RTC status callbacks"])
+_VOICE_PAGE_MARKER = 'http://127.0.0.1:5179/fusion-voice-page.json'
 
 
 class ExchangeInput(BaseModel):
@@ -45,6 +50,43 @@ def _rt(request):
 def _controller(request):
     controller = getattr(request.app.state, "rtc_controller", None)
     return controller if controller is not None else RtcController()
+
+
+async def _voice_page_ready():
+    try:
+        async with asyncio.timeout(2), httpx.AsyncClient(timeout=1.5, trust_env=False) as client:
+            async with client.stream('GET', _VOICE_PAGE_MARKER) as response:
+                if response.status_code != 200:
+                    return False
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > 256:
+                        return False
+                return json.loads(body) == {'service': 'commerce-fusion-voice'}
+    except (httpx.HTTPError, TimeoutError, ValueError):
+        return False
+
+
+async def _availability_reason(request: Request):
+    config = _controller(request).config
+    if config.MOCK_MODE:
+        return 'mock_mode'
+    try:
+        public_url = urlsplit(config.SERVER_URL)
+        if (public_url.scheme != 'https' or not public_url.hostname or public_url.username or
+                public_url.password or public_url.query or public_url.fragment or public_url.path not in ('', '/')):
+            return 'configuration'
+        validate_voice_settings(config, settings.database_url, settings.postgres_uri, api.callback_secret())
+    except (HTTPException, OSError, ValueError):
+        return 'configuration'
+    return 'ready' if await _voice_page_ready() else 'voice_ui_unavailable'
+
+
+@router.get('/availability')
+async def voice_availability(request: Request, user=Depends(get_current_user)):
+    reason = await _availability_reason(request)
+    return JSONResponse({'ready': reason == 'ready', 'reason': reason}, headers={'Cache-Control': 'no-store'})
 
 
 def _envelope(action, result=None, error=None):
@@ -81,7 +123,11 @@ async def capability(request: Request, authorization: str | None = Header(None))
 
 
 @router.post("/handoff")
-async def create_handoff(request: Request, user=Depends(get_current_user)):
+async def create_handoff(request: Request, require_ready: bool = False, user=Depends(get_current_user)):
+    if require_ready:
+        reason = await _availability_reason(request)
+        if reason != 'ready':
+            raise HTTPException(503, {'reason': reason, 'message': '实时语音尚未就绪'})
     identity = uuid.uuid4().hex
     code = "vh1." + identity + "." + secrets.token_urlsafe(32)
     await _rt(request).db("create", "voice_handoff", str(user.id),

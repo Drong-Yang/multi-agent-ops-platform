@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { initialTaskView, applyTaskEvent, normalizeTask, draftInsightFromTurn, canCreateInsight, canPublishAsset } from './fusion-state.js'
+import { initialTaskView, applyTaskEvent, normalizeTask, draftInsightFromTurn, turnContentAction, canCreateInsight, canPublishAsset } from './fusion-state.js'
 
 test('咨询转线索只预填脱敏问题，必须人工确认', () => {
   const draft = draftInsightFromTurn({ turn_id: 't1', question: '联系 13800138000 或 a@example.com，SC-PB27多重？', answer: '用户声称只有100g' })
@@ -10,6 +10,15 @@ test('咨询转线索只预填脱敏问题，必须人工确认', () => {
   assert.equal(canCreateInsight(draft), false)
   assert.equal(canCreateInsight({ ...draft, confirmed: true }), true)
   assert.equal(canCreateInsight({ ...draft, confirmed: true, summary: '   ' }), false)
+})
+
+test('只有可沉淀的模型补答显示 Wiki 入口，旧版咨询保留内容任务', () => {
+  assert.equal(turnContentAction({ answer_route: 'model_assist', wiki_candidate: true }), 'model_wiki')
+  assert.equal(turnContentAction({ answer_route: 'model_assist', wiki_candidate: false }), null)
+  assert.equal(turnContentAction({ answer_route: 'model_assist' }), null)
+  assert.equal(turnContentAction({ answer_route: 'assistant_intro' }), null)
+  assert.equal(turnContentAction({ answer_route: 'rag' }), 'content')
+  assert.equal(turnContentAction({}), 'content')
 })
 
 test('兼容任务扁平字段与原工作流values，不丢来源和事实报告', () => {

@@ -19,6 +19,7 @@ PRICE_RE = re.compile(r"(" + NUMBER + r")\s*元")
 WARRANTY_RE = re.compile(r"(?:保修|质保)\s*[:：为期约]*\s*(" + NUMBER + r")\s*(个月|月|年)")
 DIMENSION_RE = re.compile(r"(" + NUMBER + r")\s*[×xX*]\s*(" + NUMBER + r")\s*[×xX*]\s*(" + NUMBER + r")\s*(mm|cm|毫米|厘米)", re.I)
 FACT_RE = re.compile(r"(" + NUMBER + r")\s*(Wh|W|V|mm|cm)(?![A-Za-z])", re.I)
+COLOR_RE = re.compile(r"(?:^|[;\n])\s*(?:-\s*)?(?:颜色|配色)\s*:\s*([^;\n]+)")
 
 
 def _digest(value):
@@ -54,6 +55,9 @@ def extract_product_facts(content):
     if dimensions:
         factor = 10 if dimensions.group(4).lower() in ("cm", "厘米") else 1
         facts["dimensions_mm"] = [float(dimensions.group(i)) * factor for i in (1, 2, 3)]
+    colors = COLOR_RE.search(text)
+    if colors:
+        facts["colors"] = [color.strip() for color in re.split(r"[/、]", colors.group(1)) if color.strip()]
     # Preserve supported values with their units. No inference of undocumented ratings.
     values = {}
     for match in FACT_RE.finditer(text):

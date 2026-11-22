@@ -75,6 +75,7 @@ export function createFusionClient({ tokenProvider = () => globalThis.localStora
     assets: () => request('/assets'),
     publish: (asset, key = operationKey()) => request(`/assets/${asset.asset_id}/publish`, 'POST', { expected_state_version: asset.state_version }, key),
     revoke: (asset, key = operationKey()) => request(`/assets/${asset.asset_id}/revoke`, 'POST', { expected_state_version: asset.state_version }, key),
-    handoff: () => request('/voice/handoff', 'POST', {})
+    voiceAvailability: signal => request('/voice/availability', 'GET', undefined, null, false, signal),
+    handoff: signal => request('/voice/handoff?require_ready=true', 'POST', {}, null, false, signal)
   }
 }
