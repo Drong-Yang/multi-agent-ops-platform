@@ -68,6 +68,6 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
             settings.jwt_secret_key, 
             algorithms=[settings.jwt_algorithm]
         )
-        return payload
+        return None if payload.get("token_use") == "mcp" else payload
     except JWTError:
         return None

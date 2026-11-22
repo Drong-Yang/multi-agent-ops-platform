@@ -21,7 +21,8 @@ dependencies = [
   "passlib[bcrypt]>=1.7.4",
   "argon2-cffi>=25.1.0",
   "structlog>=24.1.0",
-  "httpx>=0.28.1"
+  "httpx>=0.28.1",
+  "mcp>=1.30,<2",
 ]
 
 [tool.uv]

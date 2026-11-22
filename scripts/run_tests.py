@@ -31,7 +31,8 @@ with psycopg.connect(config['POSTGRES_URI'],autocommit=True) as conn:
 plain=source_url.set(database=test_database).render_as_string(hide_password=False)
 env={**os.environ,**{k:v for k,v in config.items() if v is not None}}
 env.update(POSTGRES_URI=plain,DATABASE_URL=make_url(plain).set(drivername='postgresql+asyncpg').render_as_string(hide_password=False),
-           MOCK_MODE='true',KB_MODE='sample',FUSION_KB_MODE='sample',FUSION_ACTIVATE_RETRIEVAL='sample',PYTHONIOENCODING='utf-8')
+           MOCK_MODE='true',KB_MODE='sample',FUSION_KB_MODE='sample',FUSION_ACTIVATE_RETRIEVAL='sample',
+           FUSION_MCP_INDEX_OPERATORS='',PYTHONIOENCODING='utf-8')
 out=ROOT/'evals'/'runs';out.mkdir(parents=True,exist_ok=True)
 if args.repository_postgres:
     env['FUSION_TEST_DATABASE_URL']=plain

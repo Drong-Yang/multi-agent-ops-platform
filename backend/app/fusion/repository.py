@@ -304,7 +304,11 @@ class Repository:
                 raise Conflict("Active knowledge snapshot is not ready")
             return self._record(row)
 
-    def activate_snapshot(self, snapshot_id: str, expected_current=_UNSET):
+    def get_knowledge_pointer(self):
+        with self._transaction() as connection:
+            return dict(self._pointer(connection))
+
+    def activate_snapshot(self, snapshot_id: str, expected_current=_UNSET, *, expected_pointer_version=None):
         """Internal knowledge-admin operation: callers must authorize it."""
         with self._transaction() as connection:
             pointer = self._pointer(connection, lock=True)
@@ -315,6 +319,8 @@ class Repository:
             if row["payload"].get("status") != "ready":
                 raise Conflict("Only a ready knowledge snapshot can become active")
             if expected_current is not _UNSET and pointer["snapshot_id"] != expected_current:
+                raise Conflict("Active knowledge changed", code="snapshot_version_conflict")
+            if expected_pointer_version is not None and pointer["state_version"] != expected_pointer_version:
                 raise Conflict("Active knowledge changed", code="snapshot_version_conflict")
             if pointer["snapshot_id"] == snapshot_id:
                 return self._record(row)

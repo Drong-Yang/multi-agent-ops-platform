@@ -4,7 +4,7 @@
 
 面向电商运营，把客服咨询、证据约束的图文创作、人工审核和知识复用接到同一工作台。遇到知识缺口时，运营可以把一轮文字或语音咨询转为内容任务，补齐依据、审核草稿并按版本发布。下次遇到明确命中的售后问题，客服直接发送审核过的标准回复，跳过本轮向量检索和回答模型。
 
-**技术栈** · FastAPI · LangGraph · PostgreSQL · Milvus · Vue 3 · React · 火山引擎 Ark / RTC
+**技术栈** · FastAPI · LangGraph · MCP · PostgreSQL · Milvus · Vue 3 · React · 火山引擎 Ark / RTC
 
 ![客服试聊引用商品规格原文并展示对应资料](docs/images/01-catalog-rag.png)
 
@@ -93,6 +93,38 @@ cd ..
 - **实时语音**　配置自己的 RTC、语音助手和 ngrok 回调，在 `frontend-voice` 运行 `npm ci` 和 `npm run build`。停掉普通模式后从根目录运行 `.\start-voice.cmd -NgrokExe (Get-Command ngrok).Source -CheckOnly`，预检通过后去掉 `-CheckOnly` 启动。[配置与验收指南](docs/MANUAL_ACCEPTANCE.md)
 
 关闭普通模式用 `.\stop.cmd`，关闭语音模式用 `.\stop-voice.cmd`。追加 `-StopInfrastructure` 可同时停止本工程容器并保留数据库卷。
+
+## MCP 知识工具
+
+工作台后端通过 MCP Streamable HTTP 向独立客服或运营客户端提供工具。客户端先用工作台登录凭证调用 `POST /api/v1/mcp/token`，请求体传入 `{"scope":"knowledge"}`、`{"scope":"operations"}` 或 `{"scope":"maintenance"}`，再用返回的 15 分钟 Bearer 凭证访问对应的 MCP 入口。
+
+```mermaid
+flowchart TD
+    client["独立 MCP 客户端"] --> token["工作台登录后领取短期 MCP 令牌"]
+    token --> customer["客服权限"]
+    token --> ops["运营权限"]
+    token --> maintenance["维护权限（账号白名单）"]
+    customer --> search["search_knowledge<br/>返回证据与知识快照 ID"]
+    ops --> search
+    ops --> draft["create_wiki_draft<br/>保存待审 Wiki 草稿"]
+    draft --> review["工作台人工审核后发布"]
+    maintenance --> index["request_reindex<br/>提交 Milvus 重建任务"]
+    index --> activate["后台校验索引就绪与版本后切换快照"]
+    index -.-> status["get_reindex_job<br/>按任务 ID 查询进度"]
+```
+
+- `/mcp/knowledge/` 提供只读 `search_knowledge`，返回资料引用和知识快照 ID。
+- `/mcp/operations/` 复用 `search_knowledge`，并提供 `create_wiki_draft`，为当前账号已有的售后 Wiki 任务生成待审草稿。草稿可以在工作台继续编辑、审核及发布。
+- `/mcp/maintenance/` 提供 `request_reindex` 与 `get_reindex_job`。要启用该入口，在后端 `.env` 的 `FUSION_MCP_INDEX_OPERATORS` 设置允许运维的工作台账号 UUID，可从 `GET /api/v1/auth/me` 获取。多个账号使用逗号分隔，保存后重启服务。任务只能指向服务端已准备的 Milvus 快照，可能产生 Embedding 调用费用。后台核验索引就绪和当前快照版本后切换，已过期的任务会显示 `superseded`。Wiki 发布与撤回在原业务流程中完成。
+
+本地启动后，可用官方 MCP Python SDK 客户端验证检索。草稿示例中的任务 ID 和证据 ID 可在工作台已有 Wiki 任务的接口响应中查看，`--evidence-id` 可重复指定。命令会提示输入工作台密码。
+
+```powershell
+.\backend\.venv\Scripts\python.exe scripts\mcp_client.py --username demo search 'SC-PB27 多重' --sku SC-PB27
+.\backend\.venv\Scripts\python.exe scripts\mcp_client.py --username demo draft 'Wiki任务ID' --evidence-id '任务证据ID'
+```
+
+原始资料更新时，维护人员可从 `backend` 运行 `.\.venv\Scripts\python.exe -m app.fusion.knowledge --prepare-milvus '本地语料.json'` 注册候选快照。该命令只写本地快照清单。重启后服务会加载新快照，维护客户端可用 `reindex '快照ID' '幂等键'` 提交任务，并用 `job '任务ID'` 查询状态。
 
 ## 测试与实现范围
 

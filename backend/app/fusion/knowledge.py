@@ -316,8 +316,16 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(BACKEND / ".env")
     parser = argparse.ArgumentParser(description="Fusion knowledge readiness / explicit new-collection indexing")
-    parser.add_argument("--sync-milvus", action="store_true", help="Index only commerce_ops_fusion*; may incur Embedding charges")
+    command = parser.add_mutually_exclusive_group()
+    command.add_argument("--sync-milvus", action="store_true", help="Index only commerce_ops_fusion*; may incur Embedding charges")
+    command.add_argument("--prepare-milvus", type=Path, metavar="CORPUS_JSON",
+                         help="Register a local Milvus snapshot without indexing or activating it")
     args = parser.parse_args()
-    service = KnowledgeService(mode="milvus" if args.sync_milvus else None)
-    operation = service.sync_snapshot() if args.sync_milvus else service.ensure_ready()
-    print(json.dumps(asyncio.run(operation), ensure_ascii=False, indent=2))
+    service = KnowledgeService(mode="milvus" if args.sync_milvus or args.prepare_milvus else None)
+    if args.prepare_milvus:
+        identity = service.register_snapshot(json.loads(args.prepare_milvus.read_text(encoding="utf-8")))
+        result = {"knowledge_snapshot_id": identity, "status": "prepared"}
+    else:
+        operation = service.sync_snapshot() if args.sync_milvus else service.ensure_ready()
+        result = asyncio.run(operation)
+    print(json.dumps(result, ensure_ascii=False, indent=2))

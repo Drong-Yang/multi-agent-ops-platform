@@ -22,8 +22,9 @@ from app.fusion.faq import select_faq_assets, describe_asset, hydrate_asset_topi
 from app.fusion.legacy_rag.commerce import direct_answer,retrieval_query
 from app.fusion.legacy_rag.llm_service import LLMService
 from app.fusion.catalog_answers import catalog_quote
-from app.fusion.support_wiki import (WikiDraftInput, WikiReview, candidate_question,
-                                    prepare_wiki_review, review_wiki, select_page, suggest_wiki, wiki_evidence)
+from app.fusion.knowledge_access import KnowledgeUnavailable, active_snapshot_id
+from app.fusion.support_wiki import WikiDraftInput, WikiReview, candidate_question, review_wiki, select_page
+from app.fusion.wiki_drafts import WikiDraftUnavailable, create_wiki_draft
 
 router=APIRouter(prefix='/api/v1',tags=['Fusion'])
 callbacks=APIRouter(prefix='/callbacks/rtc',tags=['RTC callbacks'])
@@ -81,9 +82,10 @@ def sse(kind,payload,**meta):
 
 
 async def active_id(rt):
-    active=await rt.db('get_active_snapshot')
-    if not active:raise HTTPException(503,'知识快照尚未就绪')
-    return active['id']
+    try:
+        return await active_snapshot_id(rt)
+    except KnowledgeUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 async def prepare_answer(rt,session,message):
@@ -301,37 +303,10 @@ def create_wiki_task(tx, knowledge, owner, insight, topic, sid):
 
 @router.post('/content-tasks/{task_id}/wiki-draft')
 async def draft_wiki(task_id: str, body: WikiDraftInput, request: Request, user=Depends(get_current_user)):
-    rt = runtime(request)
-    task = await rt.db('get', task_id, str(user.id), 'task')
-    payload = task['payload']
-    if payload.get('content_type') != 'wiki':
-        raise Invalid('请选择售后 Wiki 任务')
-    sid, evidence = await asyncio.to_thread(wiki_evidence, rt.repo, rt.knowledge, payload, body.evidence_ids, body.supplement)
-    inputs = body.model_dump(mode='json')
-    if body.related_ids:
-        pages = await rt.db('valid_wiki', task['owner_id'])
-        related = {page['id'] for page in pages if page['payload']['task_id'] != task_id}
-        inputs['related_ids'] = [identity for identity in body.related_ids if identity in related]
-    basis = {'snapshot_id':sid, **inputs}
-    cached = payload.get('wiki_draft') or {}
-    if cached.get('basis') == basis:
-        return {**cached['fields'], 'state_version':task['state_version']}
     try:
-        suggestion = await asyncio.wait_for(suggest_wiki(payload['source_question'], evidence, mock=mode() == 'mock'), timeout=25)
-        fields = prepare_wiki_review(payload['source_question'], inputs, suggestion)
-    except Exception as exc:
-        raise HTTPException(502, '暂未生成可审核的 Wiki 草稿，请重试或手动整理') from exc
-    pending = {'basis':basis, 'fields':fields}
-    try:
-        saved = await rt.db('update_cas', task_id, task['owner_id'], task['state_version'],
-                            {**payload, 'wiki_draft':pending})
-    except Conflict:
-        saved = await rt.db('get', task_id, task['owner_id'], 'task')
-        newer = saved['payload'].get('wiki_draft') or {}
-        if newer.get('basis') != basis:
-            raise Conflict('任务已变化，请重新打开任务后继续审核')
-        fields = newer['fields']
-    return {**fields, 'state_version':saved['state_version']}
+        return await create_wiki_draft(runtime(request), str(user.id), task_id, body)
+    except WikiDraftUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @router.post('/content-tasks/{task_id}/wiki-review')

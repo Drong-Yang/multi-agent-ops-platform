@@ -32,6 +32,7 @@ from app.api.v1.image import router as image_router
 from app.api.v1.auth import router as auth_router
 from app.fusion.api import router as fusion_router, callbacks as rtc_callbacks
 from app.fusion.knowledge import KnowledgeService
+from app.fusion.mcp_tools import mount_mcp, mcp_lifespan
 from app.fusion.repository import Repository, RepositoryError
 from app.fusion.runtime import FusionRuntime
 from app.fusion.voice_gateway import router as voice_gateway_router, event_callbacks as voice_event_callbacks
@@ -102,23 +103,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await close_db()
         raise
     
-    yield
-    
-    # 关闭时执行
-    app_logger.info(f"Stopping {settings.app_name}...")
-    
     try:
-        if hasattr(app.state, 'fusion'):
-            await app.state.fusion.close()
-        await reset_graph()
-        await close_checkpointer()
-        from app.services.llm_service import llm_service
-        await llm_service.close()
-        await close_db()
-        app_logger.db_disconnected()
-        app_logger.service_stopped(app_name=settings.app_name)
-    except Exception as e:
-        app_logger.warning(f"Error during shutdown: {str(e)}", error=str(e))
+        async with mcp_lifespan(app.state.mcp_endpoints):
+            yield
+    finally:
+        app_logger.info(f"Stopping {settings.app_name}...")
+        try:
+            if hasattr(app.state, 'fusion'):
+                await app.state.fusion.close()
+            await reset_graph()
+            await close_checkpointer()
+            from app.services.llm_service import llm_service
+            await llm_service.close()
+            await close_db()
+            app_logger.db_disconnected()
+            app_logger.service_stopped(app_name=settings.app_name)
+        except Exception as e:
+            app_logger.warning(f"Error during shutdown: {str(e)}", error=str(e))
 
 
 # 创建 FastAPI 应用
@@ -172,6 +173,7 @@ app.include_router(fusion_router)
 app.include_router(rtc_callbacks)
 app.include_router(voice_gateway_router)
 app.include_router(voice_event_callbacks)
+app.state.mcp_endpoints = mount_mcp(app)
 
 
 @app.exception_handler(RepositoryError)

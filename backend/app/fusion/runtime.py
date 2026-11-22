@@ -11,6 +11,7 @@ from app.fusion.workflow import build_fusion_graph, initial_fusion_state
 from app.graph.utils import get_checkpointer
 from app.api.v1.workflow import extract_interrupt_info
 from app.fusion.intents import intent_tags
+from app.fusion.index_jobs import KnowledgeIndexJobs
 
 
 def mode():
@@ -43,6 +44,7 @@ class FusionRuntime:
         self._subscribers={}
         self._orphaned_runs={}
         self.last_worker_error=None
+        self.index_jobs=KnowledgeIndexJobs(self)
 
     async def db(self, method, *args, **kwargs):
         return await asyncio.to_thread(getattr(self.repo,method),*args,**kwargs)
@@ -84,8 +86,11 @@ class FusionRuntime:
                                   {**task['payload'],'status':'interrupted','error':payload['error']})
         self._worker=asyncio.create_task(self._loop(),name='fusion-persistent-worker')
         self._wake.set()
+        if os.getenv('FUSION_MCP_INDEX_OPERATORS', '').strip():
+            await self.index_jobs.start()
 
     async def close(self):
+        await self.index_jobs.close()
         if self._worker:
             self._worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -272,11 +277,11 @@ class FusionRuntime:
                         'knowledge_snapshot_id':payload['knowledge_snapshot_id'],'owner_id':owner},
             'mode':payload['mode']},record_id=asset_id,source_id=task_id)
 
-    async def activate_snapshot(self,snapshot_id):
+    async def activate_snapshot(self,snapshot_id,*,expected_pointer_version=None):
         readiness=await self.knowledge.ensure_ready(snapshot_id)
         if not readiness['ready']:raise ValueError('知识未就绪，不能激活')
         snapshot=self.knowledge.snapshot(snapshot_id)
         try:await self.db('get',snapshot_id,'system','knowledge_snapshot')
         except NotFound:await self.db('create','knowledge_snapshot','system',{**snapshot,'status':'ready'},record_id=snapshot_id)
-        await self.db('activate_snapshot',snapshot_id)
+        await self.db('activate_snapshot',snapshot_id,expected_pointer_version=expected_pointer_version)
         self.knowledge.activate(snapshot_id)
