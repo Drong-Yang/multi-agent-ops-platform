@@ -25,6 +25,8 @@
 
 ## 演示
 
+项目演示视频：[Bilibili](https://www.bilibili.com/video/BV1vEyHz1EPn/?share_source=copy_web&vd_source=1a998e24487e6f6983718867679d73a7) · [飞书](https://my.feishu.cn/wiki/KJ42wpvOtiqWuYkqjmkc1hFcnue?from=from_copylink)
+
 ### 1. 从咨询到审核
 
 在客服回答下点击「转为内容任务」，选择「售后 Wiki」。系统用选定资料预填待审草稿，运营核对并修改后点击「批准 Wiki 草稿」。
