@@ -7,6 +7,7 @@ from datetime import datetime,timezone
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -19,21 +20,34 @@ from psycopg import sql
 
 parser=argparse.ArgumentParser()
 parser.add_argument('--repository-postgres',action='store_true')
+parser.add_argument('--isolated-postgres', action='store_true',
+                    help='Use OPS_TEST_POSTGRES_URI targeting an existing local commerce_fusion_test database')
+parser.add_argument('--output-dir', type=Path, default=ROOT/'evals'/'runs')
 args=parser.parse_args()
 config=dotenv_values(BACKEND/'.env')
-source_url=make_url(config['POSTGRES_URI'])
-if 'fusion' not in (source_url.database or ''):
-    raise SystemExit('Refusing a non-fusion database')
 test_database='commerce_fusion_test'
-with psycopg.connect(config['POSTGRES_URI'],autocommit=True) as conn:
-    if not conn.execute('SELECT 1 FROM pg_database WHERE datname=%s',(test_database,)).fetchone():
-        conn.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(test_database)))
+if args.isolated_postgres:
+    source_url=make_url(os.environ['OPS_TEST_POSTGRES_URI'])
+    if source_url.host not in ('localhost', '127.0.0.1', '::1') or source_url.database != test_database:
+        raise SystemExit('Expected a local commerce_fusion_test database')
+else:
+    source_url=make_url(config['POSTGRES_URI'])
+    if 'fusion' not in (source_url.database or ''):
+        raise SystemExit('Refusing a non-fusion database')
+    with psycopg.connect(config['POSTGRES_URI'],autocommit=True) as conn:
+        if not conn.execute('SELECT 1 FROM pg_database WHERE datname=%s',(test_database,)).fetchone():
+            conn.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(test_database)))
 plain=source_url.set(database=test_database).render_as_string(hide_password=False)
 env={**os.environ,**{k:v for k,v in config.items() if v is not None}}
 env.update(POSTGRES_URI=plain,DATABASE_URL=make_url(plain).set(drivername='postgresql+asyncpg').render_as_string(hide_password=False),
            MOCK_MODE='true',KB_MODE='sample',FUSION_KB_MODE='sample',FUSION_ACTIVATE_RETRIEVAL='sample',
            FUSION_MCP_INDEX_OPERATORS='',DEEPSEEK_API_KEY='',PYTHONIOENCODING='utf-8')
-out=ROOT/'evals'/'runs';out.mkdir(parents=True,exist_ok=True)
+out=args.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
+if args.isolated_postgres:
+    snapshots = out / '.fixture-snapshots'
+    snapshots.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT/'knowledge'/'snapshots'/'ecommerce-v2.json', snapshots/'ecommerce-v2.json')
+    env['FUSION_KNOWLEDGE_DIR']=str(snapshots)
 if args.repository_postgres:
     env['FUSION_TEST_DATABASE_URL']=plain
     command=[sys.executable,'-m','unittest','tests.test_repository','-v']

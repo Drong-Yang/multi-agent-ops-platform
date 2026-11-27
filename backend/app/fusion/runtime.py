@@ -43,6 +43,8 @@ class FusionRuntime:
         self._wake=asyncio.Event()
         self._subscribers={}
         self._orphaned_runs={}
+        self._snapshot_activation = asyncio.Lock()
+        self.wiki_draft_requests = {}
         self.last_worker_error=None
         self.index_jobs=KnowledgeIndexJobs(self)
 
@@ -96,6 +98,8 @@ class FusionRuntime:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker
             self._worker=None
+        if self.wiki_draft_requests:
+            await asyncio.gather(*self.wiki_draft_requests.values(), return_exceptions=True)
         await self.db('close')
 
     def wake(self):
@@ -277,11 +281,26 @@ class FusionRuntime:
                         'knowledge_snapshot_id':payload['knowledge_snapshot_id'],'owner_id':owner},
             'mode':payload['mode']},record_id=asset_id,source_id=task_id)
 
-    async def activate_snapshot(self,snapshot_id,*,expected_pointer_version=None):
-        readiness=await self.knowledge.ensure_ready(snapshot_id)
-        if not readiness['ready']:raise ValueError('知识未就绪，不能激活')
-        snapshot=self.knowledge.snapshot(snapshot_id)
-        try:await self.db('get',snapshot_id,'system','knowledge_snapshot')
-        except NotFound:await self.db('create','knowledge_snapshot','system',{**snapshot,'status':'ready'},record_id=snapshot_id)
-        await self.db('activate_snapshot',snapshot_id,expected_pointer_version=expected_pointer_version)
+    async def activate_snapshot(self, snapshot_id, *, expected_pointer_version=None):
+        readiness = await self.knowledge.ensure_ready(snapshot_id)
+        if not readiness['ready']:
+            raise ValueError('知识未就绪，不能激活')
+        async with self._snapshot_activation:
+            # Preserve commit order through local activation. If the caller
+            # disconnects, the DB thread can still commit, so drain this step.
+            activation = asyncio.create_task(self._commit_snapshot(snapshot_id, expected_pointer_version))
+            try:
+                await asyncio.shield(activation)
+            except asyncio.CancelledError:
+                await asyncio.gather(activation, return_exceptions=True)
+                raise
+
+    async def _commit_snapshot(self, snapshot_id, expected_pointer_version):
+        snapshot = self.knowledge.snapshot(snapshot_id)
+        try:
+            await self.db('get', snapshot_id, 'system', 'knowledge_snapshot')
+        except NotFound:
+            await self.db('create', 'knowledge_snapshot', 'system', {**snapshot, 'status': 'ready'},
+                          record_id=snapshot_id)
+        await self.db('activate_snapshot', snapshot_id, expected_pointer_version=expected_pointer_version)
         self.knowledge.activate(snapshot_id)

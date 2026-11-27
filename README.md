@@ -1,5 +1,7 @@
 # 多Agent运营协同平台
 
+项目演示视频 · [Bilibili](https://www.bilibili.com/video/BV1vEyHz1EPn/?share_source=copy_web&vd_source=1a998e24487e6f6983718867679d73a7) · [飞书](https://my.feishu.cn/wiki/KJ42wpvOtiqWuYkqjmkc1hFcnue?from=from_copylink)
+
 ## 项目简介
 
 面向电商运营，把客服咨询、证据约束的图文创作、人工审核和知识复用接到同一工作台。客服遇到知识缺口时，可用 DeepSeek 先提供通用建议。运营再把有复用价值的售后咨询转为 Wiki 任务，补充依据、审核并发布。相同问题再次明确命中已审问法时，客服直接发送标准回复，跳过本轮向量检索和回答模型。
@@ -24,8 +26,6 @@
 - **自由创作**提供独立的选题、撰写、修订和配图流程。文本创作可在人工选题及审稿处暂停，配图使用可配置的火山方舟图像生成服务。
 
 ## 演示
-
-项目演示视频：[Bilibili](https://www.bilibili.com/video/BV1vEyHz1EPn/?share_source=copy_web&vd_source=1a998e24487e6f6983718867679d73a7) · [飞书](https://my.feishu.cn/wiki/KJ42wpvOtiqWuYkqjmkc1hFcnue?from=from_copylink)
 
 ### 1. 从咨询到审核
 

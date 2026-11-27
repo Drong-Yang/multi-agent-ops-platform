@@ -12,6 +12,25 @@ class WikiDraftUnavailable(Exception):
 
 
 async def create_wiki_draft(rt, owner_id: str, task_id: str, body: WikiDraftInput) -> dict:
+    pending = getattr(rt, 'wiki_draft_requests', None)
+    if pending is None:
+        return await _generate_draft(rt, owner_id, task_id, body)
+    key = (owner_id, task_id, body.model_dump_json())
+    generation = pending.get(key)
+    if generation is None:
+        generation = asyncio.create_task(_generate_draft(rt, owner_id, task_id, body))
+        pending[key] = generation
+
+        def forget(completed):
+            pending.pop(key)
+            if not completed.cancelled():
+                completed.exception()
+
+        generation.add_done_callback(forget)
+    return await asyncio.shield(generation)
+
+
+async def _generate_draft(rt, owner_id, task_id, body):
     task = await rt.db('get', task_id, owner_id, 'task')
     payload = task['payload']
     if payload.get('content_type') != 'wiki':
